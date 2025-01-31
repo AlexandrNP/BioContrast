@@ -1,0 +1,5 @@
+from,to,weight
+GLUD1,CPS1,3
+GLUD1,GLUL,3
+GLUD2,CPS1,3
+GLUD2,GLUL,3

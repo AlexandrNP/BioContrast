@@ -1,0 +1,5 @@
+from,to,value
+CBLIF,CUBN,3
+AMN,CUBN,3
+CUBN,CBLIF,3
+CUBN,AMN,3
