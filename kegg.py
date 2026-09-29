@@ -174,10 +174,12 @@ def construct_kegg_hierarchies(gene_set):
         hierarchy_layers[i+1] = layer_next
 
     # write_gene_list(hierarchy_layers[0]['from'], 'KEGG')
-    kegg_gene_set_path = os.path.join(DATA_DIR, 'GeneSets', 'KEGG.txt')
-    with open(kegg_gene_set_path, 'w') as out:
-        for gene in gene_kegg_subset:
-            out.write(f'{gene}\n')
+    # Disabled: KEGG.txt is a symlink to shared data (must not modify) and 20 parallel
+    # workers writing it would race. It already holds this deterministic gene_kegg_subset.
+    # kegg_gene_set_path = os.path.join(DATA_DIR, 'GeneSets', 'KEGG.txt')
+    # with open(kegg_gene_set_path, 'w') as out:
+    #     for gene in gene_kegg_subset:
+    #         out.write(f'{gene}\n')
     return hierarchy_layers, gene_kegg_subset, keggId2symbol
 
 

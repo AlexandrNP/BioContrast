@@ -1,1116 +1,97 @@
+"""
+Unified data layer for Bio-Contrast (PDX + PDO in ONE module).
+
+The two original `data.py` files diverged only in *data wiring*; here that wiring is a
+`DatasetSpec` (see dataset_spec.py) and the code path is shared. Two integrity fixes are
+baked in:
+
+  1. Disjoint CV — cross-validation splits come from `splits.make_cv_splits`
+     (StratifiedKFold outer folds), replacing the original overlapping
+     StratifiedShuffleSplit. Single-positive test folds are kept on purpose.
+  2. ComBat — for PDO, target-domain expression is batch-corrected by dataset of origin
+     before any split (unsupervised; no label leakage).  [spec.apply_combat]
+
+Family→sample expansion (the PDX replicate-leakage source) is OFF unless a spec explicitly
+turns it on.
+
+Loader method names match what trainer.py / run_experiment.py expect.
+"""
+
 import os
-import sys
 import pickle
+from copy import deepcopy
+
 import numpy as np
 import pandas as pd
-from enum import Enum
-from copy import deepcopy
-from Bio.KEGG.REST import *
-from utils import binarize_auc_response, get_balanced_class_weights, get_stratified_class_weights
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, train_test_split, ShuffleSplit
 import torch
-from torch import nn
-from torch.utils import data
-from torch.utils.data import TensorDataset, DataLoader, Dataset
+from torch.utils.data import Dataset, DataLoader
 from torch.autograd import Variable
-from torch.utils.data.dataloader import default_collate
+from sklearn.preprocessing import LabelEncoder
 
+from utils import binarize_auc_response, get_balanced_class_weights
+from splits import make_cv_splits
+from combat import combat
 
-import pickle
 pickle.HIGHEST_PROTOCOL = 4
 
-KEGG_FILE = 'KEGG/KEGG.pickle'
-KEGG_DIR = 'KEGG'
-KEGGID_DIR = os.path.join(KEGG_DIR, 'KEGGID')
-KEGG_GENE_DIR = os.path.join(KEGG_DIR, 'Symbol')
+ID_COLUMNS = ['Sample', 'UniqueID']
 
-DATA_DIR = os.path.join('pdo_data', 'raw_data')
-CELL_LINE_DIR = os.path.join(
-    DATA_DIR)
-CELL_LINE_EXPRESSION_DIR = os.path.join(CELL_LINE_DIR, 'x_data')
-CELL_LINE_RESPONSE_DIR = os.path.join(CELL_LINE_DIR, 'y_data')
-DRUG_DIR = CELL_LINE_EXPRESSION_DIR #os.path.join(CELL_LINE_DIR, 'Drug_Data')
-#NOVARTIS_DIR = os.path.join(CELL_LINE_DIR, 'PDX_Data')
-NIH_DIR = CELL_LINE_EXPRESSION_DIR
-PROCESSED_DIR = os.path.join(DATA_DIR, 'Processed')
-ENCODED_DATASET_PATH = os.path.join(PROCESSED_DIR, 'encoded_dataset.pickle')
+# --------------------------------------------------------------------------- #
+# Compatibility symbols: the copied compute modules (model/KEGG path) import   #
+# these enums from `data`. Kept here so the unified data.py is a drop-in.       #
+# --------------------------------------------------------------------------- #
+import os as _os
+from enum import Enum as _Enum
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_GENESETS = _os.path.join(_HERE, 'data', 'GeneSets')
 
+# Path constants imported by the copied KEGG modules (kegg.py etc.).
+DATA_DIR = _os.path.join(_HERE, 'data')
+KEGG_DIR = _os.path.join(_HERE, 'KEGG')
+KEGGID_DIR = _os.path.join(KEGG_DIR, 'KEGGID')
+KEGG_GENE_DIR = _os.path.join(KEGG_DIR, 'Symbol')
+PROCESSED_DIR = _os.path.join(DATA_DIR, 'Processed')
 
-class Source(Enum):
-    ALL = 'ALL'
-    CCLE = 'CCLE'
-    CTRP = 'CTRPv2'
-    GDSC = 'GDSCv2'
-    gCSI = 'gCSI'
-    NCI60 = 'NCI60'
 
+class Source(_Enum):
+    ALL = 'ALL'; CCLE = 'CCLE'; CTRP = 'CTRP'; GDSC = 'GDSC'; gCSI = 'gCSI'; NCI60 = 'NCI60'
 
-class GeneSet(Enum):
-    ALL = os.path.join(
-        DATA_DIR, 'GeneSets', 'all.txt')
-    LINCS = os.path.join(DATA_DIR, 'GeneSets', 'lincs1000_list.txt')
-    ONCOGENES_REG = os.path.join(
-        DATA_DIR, 'GeneSets', 'oncogenes_list.txt')
-    ONCOGENES_DOCKING = os.path.join(
-        DATA_DIR, 'GeneSets', 'oncogenes_gausschem4.txt')
-    KEGG = os.path.join(
-        DATA_DIR, 'GeneSets', 'KEGG.txt')
 
+class GeneSet(_Enum):
+    ALL = _os.path.join(_GENESETS, 'all.txt')
+    LINCS = _os.path.join(_GENESETS, 'lincs1000_list.txt')
+    ONCOGENES_REG = _os.path.join(_GENESETS, 'oncogenes_list.txt')
+    ONCOGENES_DOCKING = _os.path.join(_GENESETS, 'oncogenes_gausschem4.txt')
+    KEGG = _os.path.join(_GENESETS, 'KEGG.txt')
 
-class DrugInfo(Enum):
-    SMILES = 'SMILES'
-    DESCRIPTORS = 'descriptors'
-    ECFP = 'ECFP'
-    PFP = 'PFP'
 
+class DrugInfo(_Enum):
+    SMILES = 'SMILES'; DESCRIPTORS = 'descriptors'; ECFP = 'ECFP'; PFP = 'PFP'
 
-def get_gene_list(gene_set):
-    # if gene_set == GeneSet.ALL:
-    #    return None
-    gene_list = list(pd.read_csv(
-        gene_set.value, header=None).transpose().values[0]) + ['Sample']
-    return gene_list
 
-
-def get_metadata():
-    path = os.path.join(CELL_LINE_EXPRESSION_DIR, 'combined_metadata_pdo.tsv')
-    data = pd.read_csv(path, sep='\t')
-    data = data[['sample_name', 'simplified_tumor_site', 'simplified_tumor_type']]
-    data.columns = ['Sample', 'simplified_tumor_site', 'simplified_tumor_type']
-    return data
-
-
-def pickle_load(pickle_path):
-    def decorator(load_function):
-        def wrapper(*args, **kwargs):
-            suffix = ''
-            if 'source' in kwargs:
-                source = kwargs['source'].value
-                suffix = f'_{source}'
-            if 'gene_set' in kwargs:
-                gene_set = kwargs['gene_set'].value.split(
-                    '/')[-1].split('.')[0]
-                suffix = f'{suffix}_{gene_set}'
-            pickle_path_new = f'{pickle_path}{suffix}.pickle'
-            if os.path.exists(pickle_path_new):
-                return pickle.load(open(pickle_path_new, 'rb'))
-            data = load_function(*args, **kwargs)
-            pickle.dump(data, open(pickle_path_new, 'wb'))
-            return data
-        return wrapper
-    return decorator
-
-
-def csv_load(csv_path, sep='\t'):
-    def decorator(load_function):
-        def wrapper(*args, **kwargs):
-            suffix = ''
-            if 'source' in kwargs:
-                source = kwargs['source'].value
-                suffix = f'_{source}'
-            if 'gene_set' in kwargs:
-                gene_set = kwargs['gene_set'].value.split(
-                    '/')[-1].split('.')[0]
-                suffix = f'{suffix}_{gene_set}'
-            pickle_path_new = f'{csv_path}{suffix}.csv'
-            if os.path.exists(pickle_path_new):
-                return pd.read(csv_path, sep=sep)
-            data = load_function(*args, **kwargs)
-            data.to_csv(pickle_path_new, sep=sep)
-            return data
-        return wrapper
-    return decorator
-
-
-def hdf5_load(hdf5_path, sep='\t'):
-    def decorator(load_function):
-        def wrapper(*args, **kwargs):
-            suffix = ''
-            if 'source' in kwargs:
-                source = kwargs['source'].value
-                suffix = f'_{source}'
-            if 'gene_set' in kwargs:
-                gene_set = kwargs['gene_set'].value.split(
-                    '/')[-1].split('.')[0]
-                suffix = f'{suffix}_{gene_set}'
-            pickle_path_new = f'{hdf5_path}{suffix}.h5'
-            pickle_path_supplemental = f'{hdf5_path}{suffix}_supplemental.pickle'
-            if os.path.exists(pickle_path_new):
-                data = pd.read_hdf(pickle_path_new)
-
-                if os.path.exists(pickle_path_supplemental):
-                    supplemental = pickle.load(
-                        open(pickle_path_supplemental, 'rb'))
-                    return (data,) + supplemental
-
-                return data
-
-            if suffix == '':
-                suffix = '_df'
-            info = load_function(*args, **kwargs)
-            if type(info) == tuple:
-                data = info[0]
-                supplemental = info[1:]
-                pickle.dump(supplemental, open(pickle_path_supplemental, 'wb'))
-                data.to_hdf(pickle_path_new, key=suffix[1:])
-                return (data,) + supplemental
-
-            data = info
-            data.to_hdf(pickle_path_new, key=suffix[1:])
-            return data
-
-        return wrapper
-    return decorator
-
-
-def get_drug_data(data_type=DrugInfo.SMILES):
-    drug_file_descriptors = 'JasonPanDrugsAndNCI60_dragon7_descriptors.tsv'
-    drug_file_ECFP = 'JasonPanDrugsAndNCI60_dragon7_ECFP.tsv'
-    drug_file_PFP = 'JasonPanDrugsAndNCI60_dragon7_PFP.tsv'
-    drug_file_smiles = 'drug_SMILES_combined.tsv'
-
-    drug_file = None
-    if data_type == DrugInfo.DESCRIPTORS:
-        drug_file = drug_file_descriptors
-    elif data_type == DrugInfo.ECFP:
-        drug_file = drug_file_ECFP
-    elif data_type == DrugInfo.PFP:
-        drug_file = drug_file_PFP
-    elif data_type == DrugInfo.SMILES:
-        drug_file = drug_file_smiles
-    else:
-        raise Exception(
-            f'Unknown drug format {data_type}. The supported types are \'descriptors\', \'ECFP\', \'PFP\', \'SMILES\'.')
-
-    drug_path = os.path.join(DRUG_DIR, drug_file)
-    drug_data = pd.read_csv(drug_path, sep='\t')
-    if data_type == DrugInfo.SMILES:
-        drug_data['UniqueID'] = drug_data['improve_chem_id']
-        drug_data['SMILES(drug_info)'] = drug_data['canSMILES']
-        drug_data = drug_data.set_index('UniqueID', drop=False)
-        drug_data = drug_data[[
-            'UniqueID', 'SMILES(drug_info)']]
-        drug_data = drug_data.dropna(how='all')
-
-        drug_data = drug_data.transpose()
-        drug_data.columns = drug_data.loc['UniqueID', :]
-        drug_data = drug_data.drop('UniqueID')
-        drug_data['smiles'] = np.repeat('smiles', drug_data.shape[0])
-        drug_data = drug_data.groupby('smiles').first()
-        drug_data = drug_data.transpose()
-        drug_data['UniqueID'] = drug_data.index
-        drug_data = drug_data.reset_index(drop=True)
-
-    return drug_data
-
-
-def load_gene_expression_data(datapath, gene_set, separator='\t'):
-    data = None
-    if gene_set == GeneSet.ALL:
-        print('ALL GENES RECORDERED')
-        data = pd.read_csv(datapath, sep=separator)
-    else:
-        print('GENE LIST ENACTED')
-        gene_list = get_gene_list(gene_set)
-        data = pd.read_csv(datapath, sep=separator,
-                           usecols=lambda x: x in gene_list)
-        #gene_list = [x for x in gene_list if x != 'T']
-        data = data[gene_list]
-    return data
-
-
-def map_nci_drug_id(target_pdx_df):
-    drug_map = {}
-    drug_info_all = pd.read_csv(os.path.join(
-        DRUG_DIR, 'Drugs_For_OV_Proposal_Analysis.txt'), sep='\t')
-    #drug_info_all = drug_info_all[[
-    #    'UniqueID', 'NSC', 'NSC.ID(NCI_IOA_AOA_drugs)', 'NSC.ID(NCI60_drug)']]
-    for i in range(drug_info_all.shape[0]):
-        idx = drug_info_all.index[i]
-        improve_chem_id = drug_info_all.loc[idx, 'improve_chem_id']
-        drug_name = drug_info_all.loc[idx, 'drug_name']
-        drug_map[improve_chem_id] = drug_name
-        #for col in ['NSC', 'NSC.ID(NCI_IOA_AOA_drugs)', 'NSC.ID(NCI60_drug)']:
-        #    nsc_id = str(drug_info_all.loc[idx, col]).split('.')[-1]
-        #    drug_map[nsc_id] = unique_id
-
-    to_drop = [idx for idx in target_pdx_df.index if target_pdx_df.loc[idx,
-                                                                       'Drug'].split('.')[-1] not in drug_map]
-    drugs_to_drop = np.unique(target_pdx_df.loc[to_drop, 'Drug'])
-    target_pdx_df = target_pdx_df.drop(to_drop, axis=0)
-    target_pdx_df['Drug'] = [drug_map[str(
-        x.split('.')[-1])] if 'NSC' in x else x for x in target_pdx_df['Drug']]
-    return target_pdx_df
-
-
-@hdf5_load(os.path.join(PROCESSED_DIR, 'celllines_gene_expressions'))
-def get_cell_line_expression(gene_set=GeneSet.ALL):
-    datapath = os.path.join(CELL_LINE_EXPRESSION_DIR, 'cancer_gene_expression_curated.tsv')
-    data = load_gene_expression_data(datapath, gene_set)
-    data.set_index('Sample', drop=False)
-    data = data[~data.index.duplicated(keep='first')]
-    return data
-
-
-@hdf5_load(os.path.join(PROCESSED_DIR, 'novartis_pdx_gene_expressions'))
-def get_novartis_pdx_expression(gene_set=GeneSet.ALL):
-    datapath = os.path.join(CELL_LINE_EXPRESSION_DIR,
-                            'combined_rnaseq_data_novartis')
-    data = load_gene_expression_data(datapath, gene_set).fillna(0)
-    return data
-
-
-@hdf5_load(os.path.join(PROCESSED_DIR, 'nih_pdx_gene_expressions'))
-def get_nih_pdx_expression(gene_set=GeneSet.ALL):
-    datapath = os.path.join(NIH_DIR, 'cancer_gene_expression_curated.tsv')
-    data = load_gene_expression_data(datapath, gene_set)
-    pdx_ids = [x for x in data['Sample'] if('_' in str(x))] #or 'CO-' in str(x) or 'HN-' in str(x) or 'CR-' in str(x))]
-    data = data.set_index('Sample', drop=False)
-    data = data[~data.index.duplicated(keep='first')]
-    data = data.fillna(0)
-    return data.loc[pdx_ids]
-
-
-def get_cell_line_response(source=Source.ALL):
-    data = pd.read_csv(os.path.join(CELL_LINE_RESPONSE_DIR,
-                       'response.tsv'), sep='\t', low_memory=False)
-    if source != Source.ALL:
-        data = data.loc[data.index[data['source'] == source.value]][[
-            'improve_sample_id', 'improve_chem_id', 'auc']]
-    else:
-        data = data[['improve_sample_id', 'improve_chem_id', 'auc']]
-    data['Sample'] = data['improve_sample_id']
-    data['Drug'] = data['improve_chem_id']
-    data['Response'] = data['auc']
-    data = data[['Sample', 'Drug', 'Response']]
-    return data
-
-
-def get_novartis_pdx_response():
-    path = os.path.join(
-        NOVARTIS_DIR, 'ncipdm_novartis_single_drug_response.txt')
-    data = pd.read_csv(path, sep='\t')
-    data = data.loc[data.index[data['Source'] == 'Novartis']]
-    
-    return data[['Sample', 'Drug', 'Response']]
-
-
-def get_nih_pdx_response():
-    path = os.path.join(
-        NIH_DIR, 'PDO_response_combined_v2.tsv')
-    # 'ncipdm_drug_response_preprocessed_rare_Oct_2023.tsv')
-
-    data = pd.read_csv(path, sep='\t')
-    
-    data['Sample'] = data['Organoid']
-    data['Drug'] = data['Drug']
-    data['Response'] = data['AUC'] < 0.5
-
-    return data[['Sample', 'Drug', 'Response']]
-
-
-def get_novartis_nih_pdx_response():
-    # data = pd.read_csv(os.path.join(
-    #    NIH_DIR, 'ncipdm_drug_response_preprocessed.tsv'), sep='\t')
-    path = os.path.join(
-        NOVARTIS_DIR, 'cancer_gene_expression_curated.tsv')
-
-    data = pd.read_csv(path, sep='\t')
-    data = data.loc[data.index[data['Source'] == 'NCIPDM']]
-    # d = pd.read_csv(
-    #    data_config.preclinical_pdx_drug_response_file, sep='\t')
-    pdx_df = data[['Sample', 'Drug', 'Response']]
-    pdx_df['Response'] = [
-        0 if x > 0.5 else 1 for x in pdx_df['Response']]
-    pdx_df.dropna(inplace=True)
-    pdx_df['Groups'] = ['-'.join(sample.split('~')[:-1])
-                        for sample in pdx_df['Sample']]
-    pdx_df = pdx_df.groupby(by='Groups').first()
-
-    return data[['Sample', 'Drug', 'Response']]
-
-
-@hdf5_load(os.path.join(PROCESSED_DIR, 'cellline_dataset'))
-def get_cell_line_dataset(source, gene_set):
-    drugs_data = get_drug_data()
-    cell_line_rna = get_cell_line_expression(gene_set=gene_set)
-    cell_line_response = get_cell_line_response(source)
-    metadata = get_metadata()
-    id_columns = ['Sample', 'UniqueID']
-    drop_columns = ['Drug_UniqueID', 'CELL']
-    drug_columns = [
-        x for x in drugs_data.columns if x not in id_columns and x not in drop_columns]
-    rna_columns = [
-        x for x in cell_line_rna.columns if x not in id_columns and x not in drop_columns]
-    targets_columns = [
-        x for x in cell_line_response.columns if x not in id_columns and x not in drop_columns]
-    metadata_columns = [
-        x for x in metadata.columns if x not in id_columns and x not in drop_columns]
-
-    rna_response = cell_line_rna.merge(
-        cell_line_response, left_on='Sample', right_on='CELL')
-    cell_line_dataset = rna_response.merge(
-        drugs_data, left_on='Drug_UniqueID', right_on='UniqueID')
-    cell_line_dataset = cell_line_dataset.merge(metadata, on='Sample')
-    cell_line_dataset.drop(drop_columns, axis=1, inplace=True)
-
-    return cell_line_dataset, id_columns, rna_columns, drug_columns, metadata_columns, targets_columns
-
-
-# @hdf5_load(os.path.join(PROCESSED_DIR, 'novartis_dataset'))
-def get_novartis_dataset(gene_set):
-    drugs_data = get_drug_data()
-    novartis_rna = get_novartis_pdx_expression(gene_set=gene_set)
-    novartis_response = get_novartis_pdx_response()
-    # print(novartis_response)
-    novartis_response = map_nci_drug_id(novartis_response)
-    # print(novartis_response)
-    metadata = get_metadata()
-    id_columns = ['Sample', 'UniqueID']
-    drop_columns = ['Drug']
-    drug_columns = [
-        x for x in drugs_data.columns if x not in id_columns and x not in drop_columns]
-    rna_columns = [
-        x for x in novartis_rna.columns if x not in id_columns and x not in drop_columns]
-    targets_columns = [
-        x for x in novartis_response.columns if x not in id_columns and x not in drop_columns]
-    metadata_columns = [
-        x for x in metadata.columns if x not in id_columns and x not in drop_columns]
-
-    rna_response = novartis_rna.merge(
-        novartis_response, left_on='Sample', right_on='Sample')
-    novartis_dataset = rna_response.merge(
-        drugs_data, left_on='Drug', right_on='UniqueID')
-    novartis_dataset = novartis_dataset.merge(metadata, on='Sample')
-    return novartis_dataset, id_columns, rna_columns, drug_columns, metadata_columns, targets_columns
-
-
-@hdf5_load(os.path.join(PROCESSED_DIR, 'nih_dataset_smiles'))
-def get_nih_dataset(gene_set):
-    drug_data = get_drug_data()
-    nih_rna = get_nih_pdx_expression(gene_set=gene_set)
-    nih_response = get_nih_pdx_response()
-    nih_response = map_nci_drug_id(nih_response)
-    metadata = get_metadata()
-    id_columns = ['Sample', 'UniqueID']
-    drop_columns = ['Drug']
-    drug_columns = [
-        x for x in drug_data.columns if x not in id_columns and x not in drop_columns]
-    rna_columns = [
-        x for x in nih_rna.columns if x not in id_columns and x not in drop_columns]
-    targets_columns = [
-        x for x in nih_response.columns if x not in id_columns and x not in drop_columns]
-    metadata_columns = [
-        x for x in metadata.columns if x not in id_columns and x not in drop_columns]
-
-    rna_response = nih_rna.merge(
-        nih_response, left_on='Sample', right_on='Sample')
-    nih_dataset = rna_response.merge(
-        drug_data, left_on='Drug', right_on='UniqueID')
-    nih_dataset = nih_dataset.merge(metadata, on='Sample')
-
-    return nih_dataset, id_columns, rna_columns, drug_columns, metadata_columns, targets_columns
-
-# This class automatically constructs output based on drug response pair-input dataset.
-# RNA-Seq data and drug descriptors are stored in separate datasets without merging.
-# response_df contain single response metric columns with multiindex.
-# This class assumes that rna_df indices contain sample names that correspond to top-level index in response_df
-# and drug_df indices correspond to second-level index in response_df multiindex.
-
-
-class LookupDRPDataLoader(data.Dataset):
-    class MODE(Enum):
-        RNA_ITERATOR = 0,
-        DRUG_ITERATOR = 1,
-        RESPONSE_ITERATOR = 2
-
-    def _serialize(self):
-        pickle.dump(self, open(self.serialization_path, 'wb'))
-
-    def __init__(self,
-                 mode,
-                 rna_df,
-                 drug_df,
-                 response_df,
-                 rna_metadata_df=None,
-                 drug_metadata_df=None,
-                 add_noise=False,
-                 device=None):
-        self._encoder_dicts = None
-        self.serialization_path = os.path.join(
-            '.', 'LookupDRPDataLoader.pickle')
-        # drug_metadata_df = drug_metadata_df.set_index(
-        #    self.drug_label_encoder.fit_transform(drug_metadata_df.index))
-
-        self.device = device
-        self.mode = mode
-        self.rna_df = rna_df
-        self.drug_df = drug_df
-        self.rna_metadata_df = rna_metadata_df
-        self.drug_metadata_df = drug_metadata_df
-        self.response_df = response_df
-        self.add_noise = add_noise
-        self._serialize()
-
-    def get_rna_dim(self):
-        return self.rna_df.shape[1]
-
-    def get_drug_dim(self):
-        return self.drug_df.shape[1]
-
-    def __len__(self):
-        if self.mode == self.MODE.DRUG_ITERATOR:
-            return self.drug_df.shape[0]
-        if self.mode == self.MODE.RNA_ITERATOR:
-            return self.rna_df.shape[0]
-        if self.mode == self.MODE.RESPONSE_ITERATOR:
-            return self.response_df.shape[0]
-        raise Exception('Unknown running mode')
-
-    def __getitem__(self, index):
-        rna_idx = None
-        drug_idx = None
-        rna_sample = None
-        drug_sample = None
-        label = None
-        if self.mode == self.MODE.DRUG_ITERATOR:
-            return self.drug_df.loc[self.drug_df.index[index]]
-        if self.mode == self.MODE.RNA_ITERATOR:
-            rna_idx = self.rna_df.index[index]
-            rna_sample = self.rna_df.loc[rna_idx]
-        if self.mode == self.MODE.RESPONSE_ITERATOR:
-            rna_idx, drug_idx = self.response_df.index[index]
-            rna_sample = self.rna_df.loc[rna_idx]
-            drug_sample = self.drug_df.loc[drug_idx]
-            label = self.response_df.loc[self.response_df.index[index]]
-
-        if self.add_noise:
-            std = 0.05
-            rna_sample = rna_sample + \
-                np.random.normal(0, std, size=len(
-                    self.rna_diameters))*self.rna_diameters
-            rna_sample = np.array(rna_sample)
-
-        rna_metadata = None
-        drug_metadata = None
-        if self.rna_metadata_df is not None:
-            rna_metadata = self.rna_metadata_df.loc[rna_idx].values
-        if self.drug_metadata_df is not None:
-            if drug_idx is None:
-                raise Exception(
-                    "A wrong running mode! There is no drug information but drug metadata is present.")
-            drug_metadata = self.drug_metadata_df.loc[drug_idx].values
-        if self.device is not None:
-            if rna_sample is None:
-                rna_sample = 0
-            if drug_sample is None:
-                drug_sample = 0
-            if label is None:
-                label = 0
-            if rna_metadata is None:
-                rna_metadata = 0
-            if drug_metadata is None:
-                drug_metadata = 0
-            rna_sample = Variable(torch.from_numpy(
-                np.array(rna_sample, dtype=np.float16))).float().to(self.device)
-
-            drug_sample = Variable(torch.from_numpy(
-                np.array(drug_sample, dtype=np.float16))).float().to(self.device)
-
-            label = Variable(torch.from_numpy(
-                np.array(label))).float().to(self.device)
-
-        return rna_sample, drug_sample, label, rna_metadata, drug_metadata
-
-
-class DRPDataLoader(data.Dataset):
-    def __init__(self,
-                 device,
-                 indices,
-                 rna_df,
-                 drug_df,
-                 metadata_df,
-                 labels,
-                 add_noise=False):
-        # list_IDs, labels, drug_df, rna_df, binding_df, add_noise=False):
-        'Initializing...'
-        self.device = device
-        drug_df = drug_df.reset_index()
-        self.labels = labels
-        self.indices = indices
-        self.drug_df = pd.DataFrame(drug_df).reset_index(drop=True)
-        self.rna_df = pd.DataFrame(rna_df).reset_index(drop=True)
-        self.metadata_df = pd.DataFrame(metadata_df).reset_index(drop=True)
-
-        self.drug_df.loc[drug_df.index, 'UniqueID'] = [
-            int(x.split('_')[-1]) for x in drug_df['UniqueID']]
-
-        self.drug_ids = torch.tensor(self.drug_df['UniqueID'])
-        # self.drug_diameters = drug_df.apply(np.ptp, axis=0)
-        # self.drug_size = drug_df.shape[1]
-        self.rna_size = rna_df.shape[1]
-        self.add_noise = add_noise
-
-    def __len__(self):
-        'Denotes the total number of samples'
-        return len(self.list_IDs)
-
-    def __getitem__(self, index):
-        'Generates one sample of data'
-        index = self.indices[index]
-        v_d = self.drug_df.iloc[index]  # ['drug_encoding']
-        v_p = np.array(self.rna_df.iloc[index])
-        # v_b = np.array(self.binding_df.iloc[index])
-        d_id = np.array(self.drug_df.iloc[index]['UniqueID'])
-        if self.add_noise:
-            std = 0.05
-            # v_d = v_d + np.random.multivariate_normal(np.repeat(0, self.drug_size), np.diag(self.drug_diameters*std))
-            # np.random.multivariate_normal(np.repeat(0, self.rna_size), np.diag(self.rna_diameters*std))
-            v_p = v_p + \
-                np.random.normal(0, std, size=len(
-                    self.rna_diameters))*self.rna_diameters
-            v_p = np.array(v_p)
-            # np.random.multivariate_normal(np.repeat(0, self.binding_size), np.diag(self.binding_diameters*std))
-            v_b = v_b + \
-                np.random.normal(0, std, size=len(
-                    self.binding_diameters))*self.binding_diameters
-            v_b = np.array(v_b)
-        y = np.array(self.labels[index])
-
-        return v_d, v_p, v_b, y, d_id
-
-
-class ContrastiveDrugCellLineDataset(data.Dataset):
-    def __init__(self,
-                 device,
-                 indices,
-                 cell_line_rna_df,
-                 drug_df,
-                 metadata_df,
-                 labels,
-                 add_noise=False):
-        self.device = device
-        drug_df = drug_df.reset_index()
-        self.labels = labels
-        self.indices = indices
-        self.drug_df = pd.DataFrame(drug_df).reset_index(drop=True)
-        self.cell_line_rna_df = pd.DataFrame(
-            cell_line_rna_df).reset_index(drop=True)
-        self.metadata_df = pd.DataFrame(metadata_df).reset_index(drop=True)
-
-
-def get_drug_cell_line_paired_loader(source, gene_set):
-    cell_line_dataset, id_columns, rna_columns, drug_columns, metadata_columns, targets_columns = get_cell_line_dataset(
-        source, gene_set)
-
-
-def get_data():
-    cell_data, cell_id_columns, cell_rna_columns, cell_drug_columns, cell_metadata_columns, cell_targets_columns = get_cell_line_dataset(
-        source=Source.ALL, gene_set=GeneSet.ALL)
-
-    cell_to_drop = ['SOURCE', 'CCLE_CCL_UniqueID', 'NCI60_CCL_UniqueID', 'DRUG', 'STUDY',
-                    'AUC1', 'AAC1', 'DSS1', 'IC50', 'EC50', 'EC50se', 'R2fit', 'Einf', 'HS']  # 'AUC',
-    cell_data.drop(cell_to_drop, axis=1, inplace=True)
-
-    pdx_data, pdx_id_columns, pdx_rna_columns, pdx_drug_columns, pdx_metadata_columns, pdx_targets_columns = get_nih_dataset(
-        gene_set=GeneSet.ALL)
-
-
-def expand_nih_response_dataset(nih_response_df, individual_samples):
-    corresponding_families = ['-'.join(x.split('-')[:-1])
-                              for x in individual_samples]
-    families_df = pd.DataFrame(np.array([individual_samples, corresponding_families]).transpose(
-    ), columns=['IndividualSample', 'Sample'])
-    expanded_df = nih_response_df.merge(families_df, how='inner', on='Sample')
-    expanded_df.drop('Sample', axis=1, inplace=True)
-    expanded_df.columns = ['Sample' if x ==
-                           'IndividualSample' else x for x in expanded_df.columns]
-
-    return expanded_df
-
-
-class ResponseDataset(Dataset):
-    def __init__(self, response_df, rna_df, device, sample_indices=None):
-        super().__init__()
-        if type(rna_df) is not torch.Tensor:
-            self.sample_indices = torch.tensor(rna_df.index.values).int().to(device)
-            self.rna_df = torch.tensor(rna_df.values).to(device)
-            #if self.rna_indices is None:
-            #    self.rna_indices = torch.tensor(rna_df.index.values).to(device)
-        else:
-            self.rna_df = rna_df
-            self.sample_indices = sample_indices.int()
-        if type(response_df) is not torch.Tensor:
-            response_df.reset_index(inplace=True)
-            self.response_indices = torch.tensor(response_df.index.values).to(device)
-            self.response_df = torch.tensor(response_df.values).to(device)
-            #if self.response_indices is None:
-            #    self.response_indices = torch.tensor(response_indices.index.values).to(device)
-        else:
-            self.response_df = response_df
-            self.response_indices = torch.tensor(list(range(self.response_df.shape[0]))).int().to(device)
-        #self.indices = list(range(self.response_df.shape[0])) #self.response_df #.index
-        self.device = device
-
-    def __getitem__(self, index):
-        sample_id = torch.nonzero(self.sample_indices == self.response_df[self.response_indices[index],1], as_tuple=True)[0][0]
-        return self.rna_df[sample_id.item(),:].float(), \
-            self.response_df[self.response_indices[index].item(),2].float()
-
-    def __len__(self):
-        return self.response_df.shape[0]
-
-
-class DrugSpecificPairedDataset(Dataset):
-    def _serialize(self):
-        pickle.dump(self, open(self.serialization_path, 'wb'))
-
-    #
-    # Paired dataset would return a tuple (Data1_batch, Data2_batch, match_matrix) of the size (batch_size, batch_size, batch_size*batch_size)
-    # Match is counted when cell line and pdx model both result in response
-    #
-    # num_samples: number of samples that paired dataset will generate
-    # batch_size: number of samples returned after each dataset query
-    #
-
-    def __init__(self,
-                 num_samples,
-                 batch_size,
-                 cell_line_rna_df,
-                 cell_line_response_df,
-                 pdx_rna_df,
-                 pdx_response_df,
-                 cell_line_indices=None,
-                 pdx_indices=None,
-                 cell_line_rna_metadata_df=None,
-                 pdx_rna_metadata_df=None,
-                 response_match_function=None,
-                 device=None,
-                 serialize=False):
-        super().__init__()
-
-        self.num_samples = num_samples
-        self.batch_size = batch_size
-        self.cell_line_indices = cell_line_indices
-        self.pdx_indices = pdx_indices
-
-        self._encoder_dicts = None
-        self.serialization_path = os.path.join(
-            '.', 'PairedDataset.pickle')
-        # drug_metadata_df = drug_metadata_df.set_index(
-        #    self.drug_label_encoder.fit_transform(drug_metadata_df.index))
-
-        self.device = device
-
-        self.cell_line_rna_df = cell_line_rna_df
-        self.cell_line_response_df = cell_line_response_df
-        self.pdx_rna_df = pdx_rna_df
-        self.pdx_response_df = pdx_response_df
-
-        self.cell_line_rna_metadata_df = cell_line_rna_metadata_df
-        self.pdx_rna_metadata_df = pdx_rna_metadata_df
-
-        unique_cell_line_samples = torch.unique(
-            self.cell_line_response_df[:,1]) # 'Sample' columns
-        cell_line_dataset = ResponseDataset(self.cell_line_response_df,
-                                            self.cell_line_rna_df.loc[unique_cell_line_samples.detach().to('cpu')],
-                                            sample_indices=self.cell_line_indices,
-                                            device=self.device)
-        unique_pdx_samples = torch.unique(self.pdx_response_df[:,1]) # 'Sample' columns
-        pdx_dataset = ResponseDataset(self.pdx_response_df,
-                                      self.pdx_rna_df.loc[unique_pdx_samples.detach().to('cpu')],
-                                      sample_indices=self.pdx_indices,
-                                      device=self.device)
-
-        # self.matches = pd.DataFrame(unique_cell_line_samples.transpose()).merge(pd.DataFrame(unique_pdx_samples.transpose()), how='cross')
-        # self.matches.columns = ['CellLine_Sample', 'PDX_Sample']
-        self.batches = {}
-
-        def create_dataset_balanced(self, response_match_function):
-            cell_line_weights = get_balanced_class_weights(
-                self.cell_line_response_df)
-            pdx_weights = get_balanced_class_weights(self.pdx_response_df)
-
-            cell_line_sampler = torch.utils.data.sampler.WeightedRandomSampler(
-                cell_line_weights, num_samples)
-            pdx_sampler = torch.utils.data.sampler.WeightedRandomSampler(
-                pdx_weights, num_samples)
-
-            # Data load with balanced sampling
-            self._cell_line_dataloader = DataLoader(
-                cell_line_dataset, batch_size=batch_size, sampler=cell_line_sampler)
-            self._pdx_dataloader = DataLoader(
-                pdx_dataset, batch_size=batch_size, sampler=pdx_sampler)
-
-            # Paired sampling, matched batches
-            if response_match_function is None:
-                # def response_match_function(df_x, df_y):
-                #    return torch.stack([df_x * x for x in df_y]).squeeze()
-
-                def response_match_function(df_x, df_y):
-                    return torch.stack([df_x * y for y in df_y]).squeeze() - torch.stack([torch.where(df_x != y, torch.ones_like(df_x), torch.zeros_like(df_x)) for y in df_y]).squeeze()
-
-            for batch_id, ((cell_line_samples, cell_line_response), (pdx_samples, pdx_response)) in enumerate(zip(self._cell_line_dataloader, self._pdx_dataloader)):
-                response_match = response_match_function(
-                    cell_line_response, pdx_response)
-                self.batches[batch_id] = (cell_line_samples,
-                                          pdx_samples,
-                                          response_match.to(self.device),
-                                          cell_line_response.to(
-                                              self.device),
-                                          pdx_response.to(self.device))
-
-        def create_dataset_full(self, response_match_function):
-            # Data load with sequential sampling
-            drop_last = cell_line_dataset.shape[0] % batch_size < 2
-            self._cell_line_dataloader = DataLoader(
-                cell_line_dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last)
-            self._pdx_dataloader = DataLoader(
-                pdx_dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last)
-
-            # Sequential sampling, all batches
-            batch_id = 0
-            full_num_samples = 0
-
-            if response_match_function is None:
-                def response_match_function(df_x, df_y):
-                    return torch.stack([df_x * x for x in df_y]).squeeze()
-
-            for i, (cell_line_samples, cell_line_response) in enumerate(self._cell_line_dataloader):
-                for j, (pdx_samples, pdx_response) in enumerate(self._pdx_dataloader):
-
-                    response_match = response_match_function(
-                        cell_line_response, pdx_response)
-                    self.batches[batch_id] = (cell_line_samples,
-                                              pdx_samples,
-                                              response_match.to(self.device),
-                                              cell_line_response.to(
-                                                  self.device),
-                                              pdx_response.to(self.device))
-                    batch_id += 1
-                    full_num_samples += batch_size
-
-            self.num_samples = full_num_samples
-
-        # create_dataset_full(self, response_match_function)
-        create_dataset_balanced(self, response_match_function)
-        if serialize:
-            self._serialize()
-
-    def get_cell_line_rna_dim(self):
-        return self.cell_line_rna_df.shape[1]
-
-    def get_pdx_rna_dim(self):
-        return self.pdx_rna_df.shape[1]
-
-    def __len__(self):
-        return np.int64(np.ceil(self.num_samples / self.batch_size))
-
-    def __getitem__(self, index):
-        return self.batches[index]
-
-
-class ResponseDataloadersFactory:
-    def __init__(self,
-                 cell_line_source,
-                 gene_set,
-                 cross_validation_num,
-                 validation_size=0.2,
-                 random_seed=2023,
-                 device=None):
-        id_columns = ['Sample', 'UniqueID']
-
-        self.drug_data = get_drug_data()
-        self.cell_line_rna = get_cell_line_expression(gene_set=gene_set)
-        self.cell_line_response = get_cell_line_response(cell_line_source)
-        self.cell_line_response.columns = ['Sample', 'UniqueID', 'Response']
-        self.binarized_cell_line_response = deepcopy(self.cell_line_response)
-        self.binarized_cell_line_response['Response'] = binarize_auc_response(
-            self.cell_line_response['Response'])
-        self.cell_line_metadata = get_metadata()
-
-        self.drug_data.set_index(id_columns[1], inplace=True)
-        self.cell_line_response.set_index(id_columns[1], inplace=True)
-        self.binarized_cell_line_response.set_index(
-            id_columns[1], inplace=True)
-        self.cell_line_rna.set_index(id_columns[0], inplace=True)
-        self.cell_line_metadata.set_index(id_columns[0], inplace=True)
-
-        self.nih_rna = get_nih_pdx_expression(gene_set=gene_set)
-        self.nih_rna['Sample'] = [
-            '-'.join(x.split('~')) for x in self.nih_rna['Sample']]
-        self.nih_response = get_nih_pdx_response()
-        #self.nih_response = expand_nih_response_dataset(
-        #    self.nih_response, self.nih_rna['Sample'])
-        #
-        #self.nih_response = map_nci_drug_id(self.nih_response)
-        #self.nih_response = self.nih_response[['Sample', 'Drug', 'Response']]
-        self.nih_response.columns = ['Sample', 'UniqueID', 'Response']
-        self.nih_metadata = get_metadata()
-        self.nih_response.set_index('Sample', inplace=True)
-        samples = np.intersect1d(self.nih_rna.index, self.nih_response.index)
-        self.nih_response = self.nih_response.loc[samples]
-        self.nih_response.reset_index(inplace=True)
-
-        self.nih_response.set_index(id_columns[1], inplace=True)
-        self.nih_rna.set_index(id_columns[0], inplace=True)
-        self.nih_metadata.set_index(id_columns[0], inplace=True)
-
-        self.nih_rna = self.nih_rna.loc[samples]
-        self.nih_metadata = self.nih_metadata.loc[samples]
-        
-        self.cell_line_response_data_splits = {}
-        self.pdx_response_data_splits = {}
-        self.cross_validation_num = cross_validation_num
-        self.validation_size = validation_size
-        self.random_seed = random_seed
-
-        self._drug_ids = np.unique(self.drug_data.index)
-        self.device = device
-
-        self.cell_line_sample_encoder = LabelEncoder()
-        self.pdx_sample_encoder = LabelEncoder()
-        self.cell_line_rna.index = self.cell_line_sample_encoder.fit_transform(
-            self.cell_line_rna.index)
-        self.nih_rna.index = self.pdx_sample_encoder.fit_transform(
-            self.nih_rna.index)
-        sample_column = 'Sample'
-        self.cell_line_response[sample_column] = self.cell_line_sample_encoder.transform(
-            self.cell_line_response[sample_column])
-        self.binarized_cell_line_response[sample_column] = self.cell_line_sample_encoder.transform(
-            self.binarized_cell_line_response[sample_column])
-        self.nih_response[sample_column] = self.pdx_sample_encoder.transform(
-            self.nih_response[sample_column])
-
-        self._prepare_drugwise_response_cv_splits(
-            self.cross_validation_num, self.validation_size, self.random_seed)
-
-    def _prepare_drugwise_response_cv_splits(self, cross_validation_num, validation_size=0.2, random_seed=2023):
-
-        def create_train_val_test_splits(df, strat_condition, cross_validation_num, validation_size, random_seed):
-            df.reset_index(inplace=True)
-            cv_splits = {}
-            test_size = 1./cross_validation_num
-            cell_line_splitter = StratifiedShuffleSplit(
-                n_splits=cross_validation_num, test_size=test_size, random_state=random_seed)
-            cell_line_cv = cell_line_splitter.split(
-                strat_condition, strat_condition)
-
-            for cv_idx, (cl_global_train_idx, cl_test_idx) in enumerate(cell_line_cv):
-                cv_splits[cv_idx] = {}
-                val_splitter = StratifiedShuffleSplit(
-                    n_splits=1, test_size=validation_size, random_state=random_seed)
-                cl_train_idx, cl_val_idx = next(val_splitter.split(strat_condition.iloc[cl_global_train_idx],
-                                                                   strat_condition.iloc[cl_global_train_idx]))
-                # train_test_split(strat_condition[cl_global_train_idx],
-                #                 test_size=validation_size,
-                #                 random_state=random_seed,
-                #                 stratify=strat_condition[cl_global_train_idx])
-                cl_train_idx = cl_global_train_idx[cl_train_idx]
-                cl_val_idx = cl_global_train_idx[cl_val_idx]
-                df['UniqueID'] = [str(x) for x in df['UniqueID'].values]
-                #if type(df['UniqueID'].loc[0]) is str:
-                df['UniqueID'] = [int(x.split('_')[-1]) for x in df['UniqueID'].values]
-                df['Response'] = df['Response'].astype(float)
-                #breakpoint()
-                cv_splits[cv_idx]['train'] = torch.tensor(df.loc[df.index[cl_train_idx]].values).to(self.device)
-                cv_splits[cv_idx]['val'] = torch.tensor(df.loc[df.index[cl_val_idx]].values).to(self.device)
-                cv_splits[cv_idx]['test'] = torch.tensor(df.loc[df.index[cl_test_idx]].values).to(self.device)
-
-            return cv_splits
-
-        #breakpoint()
-        for drug_id in np.unique(self.drug_data.index):
-
-            if drug_id in self.cell_line_response.index:
-                drug_cell_line_response = self.cell_line_response.loc[drug_id]
-                binarized_drug_cell_line_response = self.binarized_cell_line_response.loc[
-                    drug_id]
-                if sum(binarized_drug_cell_line_response['Response']) < 2:
-                    continue
-            
-                self.cell_line_response_data_splits[drug_id] = create_train_val_test_splits(drug_cell_line_response,  # binarized_drug_cell_line_response, #drug_cell_line_response,
-                                                                                            binarized_drug_cell_line_response[
-                                                                                                'Response'],
-                                                                                            cross_validation_num=cross_validation_num,
-                                                                                            validation_size=validation_size,
-                                                                                            random_seed=random_seed)
-
-            selected_pdo_drugs =['Drug_1036', 'Drug_1103', 'Drug_1418', 'Drug_1493', 'Drug_293', 'Drug_384', 'Drug_384']
-            if drug_id in self.nih_response.index:
-                drug_nih_response = self.nih_response.loc[drug_id]
-                #if drug_nih_response.shape[0] < 10:
-                #    continue
-                #breakpoint()
-                if drug_id not in selected_pdo_drugs:
-                    continue
-                if sum(drug_nih_response['Response']) < 2 or drug_nih_response.shape[0]-sum(drug_nih_response['Response']) < 2:
-                    #if sum(drug_nih_response['Response']) > 0:
-                    #    print(drug_id)
-                    continue
-
-                self.pdx_response_data_splits[drug_id] = create_train_val_test_splits(drug_nih_response,
-                                                                                      drug_nih_response['Response'],
-                                                                                      cross_validation_num=cross_validation_num,
-                                                                                      validation_size=validation_size,
-                                                                                      random_seed=random_seed)
-
-    def _get_dataloaders(self, split, rna_df, batch_size, num_samples=None, device=None):
-        dataloaders = {}
-        for key in split:
-
-            rna_df = rna_df
-            dataset = ResponseDataset(response_df=split[key],
-                                      rna_df=rna_df,
-                                      device=device)
-            drop_last = len(dataset) % batch_size < 2
-            if key == 'train':
-                if num_samples is not None:
-                    # weights = get_stratified_class_weights(split[key])
-                    # weights = get_balanced_class_weights(split[key])
-                    weights = torch.ones(split[key].shape[0])
-                    sampler = torch.utils.data.sampler.WeightedRandomSampler(
-                        weights, num_samples=num_samples)
-                    dataloaders[key] = DataLoader(dataset,
-                                                  batch_size=batch_size,
-                                                  sampler=sampler,
-                                                  drop_last=drop_last)
-                else:
-                    dataloaders[key] = DataLoader(dataset,
-                                                  batch_size=batch_size,
-                                                  shuffle=True,
-                                                  drop_last=drop_last)
-            else:
-                dataloaders[key] = DataLoader(dataset,
-                                              batch_size=batch_size,
-                                              shuffle=False,
-                                              drop_last=drop_last)
-            # collate_fn=lambda x: tuple(x_.to(self.device) for x_ in default_collate(x))
-        return dataloaders['train'], dataloaders['val'], dataloaders['test']
-
-    def get_drug_specific_cell_line_dataloaders(self, drug_id, cv_idx, batch_size=128, num_samples=None):
-        response_split = self.cell_line_response_data_splits[drug_id][cv_idx]
-        unique_samples = torch.cat(
-            [response_split[key][:,1] for key in response_split.keys()]) # 'Sample' column stands for 1
-        rna_df = self.cell_line_rna.loc[unique_samples.detach().int().to('cpu')]
-        rna_df = rna_df[~rna_df.index.duplicated(keep='first')]
-        return self._get_dataloaders(split=response_split,
-                                     rna_df=rna_df,
-                                     batch_size=batch_size,
-                                     num_samples=num_samples,
-                                     device=self.device)
-
-    def get_drug_specific_pdx_dataloaders(self, drug_id, cv_idx, batch_size=128, num_samples=None):
-        response_split = self.pdx_response_data_splits[drug_id][cv_idx]
-        unique_samples = torch.cat(
-            [response_split[key][:,1] for key in response_split.keys()]) # 'Sample' column stands for :,1
-        rna_df = self.nih_rna.loc[unique_samples.detach().int().to('cpu')]
-        rna_df = rna_df[~rna_df.index.duplicated(keep='first')]
-        return self._get_dataloaders(split=response_split,
-                                     rna_df=rna_df,
-                                     batch_size=batch_size,
-                                     num_samples=num_samples,
-                                     device=self.device)
-
-    def get_paired_dataloaders_keys(self):
-        keys = {}
-        for drug_id in self._drug_ids:
-
-            if drug_id not in self.cell_line_response_data_splits or drug_id not in self.pdx_response_data_splits:
-                continue
-
-            keys[drug_id] = {}
-
-            for cv_idx in range(self.cross_validation_num):
-                keys[drug_id][cv_idx] = {}
-        return keys
-
-    def get_paired_cell_line_pdx_loaders(self, drug_id, cv_idx, num_samples, batch_size=128):
-        drug_dataloaders = {}
-        cell_line_response_split = deepcopy(
-            self.cell_line_response_data_splits[drug_id][cv_idx])
-        pdx_response_split = self.pdx_response_data_splits[drug_id][cv_idx]
-        for set_name in cell_line_response_split:
-            unique_cell_line_samples = torch.unique(
-                cell_line_response_split[set_name][:,1]) # sample columns ['Sample']
-            unique_pdx_samples = torch.unique(
-                pdx_response_split[set_name][:,1]) # sample columns ['Sample']
-            cell_line_response_split[set_name][:,2] = binarize_auc_response(
-                cell_line_response_split[set_name][:,2]) # response columns ['Response']
-
-            effective_num_samples = num_samples
-            if set_name != 'train':
-                effective_num_samples = 1000
-
-            paired_dataset = DrugSpecificPairedDataset(effective_num_samples,
-                                                       batch_size,
-                                                       self.cell_line_rna.loc[unique_cell_line_samples.to('cpu').detach()],
-                                                       cell_line_response_split[set_name],
-                                                       self.nih_rna.loc[unique_pdx_samples.to('cpu').detach()],
-                                                       pdx_response_split[set_name],
-                                                       cell_line_indices=self.cell_line_rna.index,
-                                                       pdx_indices=self.nih_rna.index,
-                                                       cell_line_rna_metadata_df=None,
-                                                       pdx_rna_metadata_df=None,
-                                                       response_match_function=None,
-                                                       device=self.device)
-            drug_dataloaders[set_name] = DataLoader(
-                paired_dataset, batch_size=1)
-        return drug_dataloaders['train'], drug_dataloaders['val'], drug_dataloaders['test']
-
-
-def get_data_generator(dataloader: DataLoader):
-    if dataloader is None:
-        return None
-    return dataloader.__iter__()
+# KEGG pathway helpers (imported by the model's KEGG-CNN path). Loaded from the existing
+# KEGG.pickle on disk — no network call.
+KEGG_FILE = _os.path.join(_HERE, 'data', 'KEGG.pickle')
 
 
 def get_kegg(organism='hsa'):
-    if os.path.isfile(KEGG_FILE):
+    if _os.path.isfile(KEGG_FILE):
         return pickle.load(open(KEGG_FILE, 'rb'))
-    ref_pathways = np.array(kegg_list('path').read().split('\n'))
-    # print(ref_pathways)
-
-    processed_pathways = []
-    for pathway in ref_pathways:
-        if len(pathway) > 0:
-            try:
-                processed_pathways.append(
-                    pathway.split('\t')[0].split('map')[1])
-            except:
-                continue
-    ref_pathways = processed_pathways
-
-    # hsa_entries = np.array(kegg_list('hsa').read().split('\n'))
-    # hsa_entries = np.array([x.split('\t')[0].split(':')[1] for x in hsa_entries if len(x) > 0])
-    # hsa_entries = np.array([x for x in hsa_entries if (len(x) == 5)])
-
-    # print(np.shape(ref_pathways))
-    # print(ref_pathways)
-
-    org_pathways = []
-    for path_code in ref_pathways:
-        # print(path_code)
-        pathway = None
+    from Bio.KEGG.REST import kegg_list, kegg_get  # only if the cache is missing
+    ref = [p.split('\t')[0].split('map')[1] for p in kegg_list('path').read().split('\n')
+           if len(p) > 0 and 'map' in p]
+    org = []
+    for code in ref:
         try:
-            pathway = kegg_get('{}{}'.format(organism, path_code)).read()
-        except:
-            try:
-                pathway = kegg_get('{}{}'.format('map', path_code)).read()
-            except:
-                continue
-        org_pathways.append(pathway)
-    # print(np.array(org_pathways))
-    # print(np.shape(org_pathways))
-    pickle.dump(org_pathways, open(KEGG_FILE, 'wb'))
-    return org_pathways
+            org.append(kegg_get(f'{organism}{code}').read())
+        except Exception:
+            continue
+    pickle.dump(org, open(KEGG_FILE, 'wb'))
+    return org
 
 
 def get_genes(pathways):
-    processed_pathways = {}
-    pathway_names = {}
-    keggId2symbol = {}
+    processed_pathways, pathway_names, keggId2symbol = {}, {}, {}
     for pathway in pathways:
         is_gene = False
         pathway_idx = None
@@ -1129,65 +110,529 @@ def get_genes(pathways):
                 tokens = line.split(';')[0].split(' ')
                 if len(tokens) < 3:
                     continue
-                gene = tokens[-1]
-                kegg_id = tokens[-3]
-                keggId2symbol[kegg_id] = gene
-                processed_pathways[pathway_name].append(gene)
-
+                keggId2symbol[tokens[-3]] = tokens[-1]
+                processed_pathways[pathway_name].append(tokens[-1])
     return processed_pathways, pathway_names, keggId2symbol
 
 
 def get_pathways():
-    kegg = get_kegg()
-    return get_genes(kegg)
+    return get_genes(get_kegg())
 
 
 def fetch_kegg_pathway_hierarchy():
-    # Fetch the list of all pathways
-    # pathway_list = kegg_list("pathway").read()
-    pathway_list, pathway_codes = get_pathways()
-
-    # Dictionary to store the hierarchy
-    pathway_hierarchy = {}
-
-    # Process each line in the pathway list
+    _, pathway_codes = get_pathways()
+    hierarchy = {}
     for pathway_name, pathway_id in pathway_codes.items():
-        # Extract pathway category from the pathway name
-        category = pathway_name.split(" - ")[0]
-
-        if category not in pathway_hierarchy:
-            pathway_hierarchy[category] = []
-
-        # Add pathway to the respective category
-        pathway_hierarchy[category].append((pathway_id, pathway_name))
-
-    return pathway_hierarchy
+        hierarchy.setdefault(pathway_name.split(" - ")[0], []).append((pathway_id, pathway_name))
+    return hierarchy
 
 
-if __name__ == "__main__":
-    cross_validation_num = 5
-    dataloader_factory = ResponseDataloadersFactory(
-        cell_line_source=Source.CCLE,
-        gene_set=GeneSet.ALL,
-        cross_validation_num=cross_validation_num,
-        validation_size=0.2,
-        random_seed=2023)
+# --------------------------------------------------------------------------- #
+# Low-level loaders (spec-driven)                                             #
+# --------------------------------------------------------------------------- #
+def _norm_sample(series):
+    """Canonicalise sample-id separators so response and expression tables join."""
+    return (series.astype(str)
+            .str.replace('~', '-', regex=False)
+            .str.replace('.', '-', regex=False))
 
-    keys = dataloader_factory.get_paired_dataloaders_keys()
-    for drug_id in keys:
-        for cv_split in keys[drug_id]:
-            paired_train_dataloaders, paired_val_dataloader, paired_test_dataloader = \
-                dataloader_factory.get_paired_cell_line_pdx_loaders(
-                    drug_id, cv_split, num_samples=1000, batch_size=64)
-            cell_line_train_loader, cell_line_val_loader, cell_line_test_loader = \
-                dataloader_factory.get_drug_specific_cell_line_dataloaders(
-                    drug_id, cv_split, num_samples=1000, batch_size=256)
-            pdx_train_loader, pdx_val_loader, pdx_test_loader \
-                = dataloader_factory.get_drug_specific_pdx_dataloaders(drug_id, cv_split, num_samples=1000, batch_size=256)
 
-            # for i, (cell_rna, auc) in enumerate(cell_line_train_loader):
-            #    breakpoint()
-            #    pass
-            # for i, (cell_rna, pdx_rna, matches) in enumerate(paired_train_dataloaders):
-            #    breakpoint()
-            #    pass
+def get_gene_list(gene_set):
+    # Accept either a path string (unified callers) or a GeneSet enum (copied KEGG modules).
+    path = gene_set.value if hasattr(gene_set, 'value') else gene_set
+    genes = list(pd.read_csv(path, header=None).transpose().values[0])
+    return genes + ['Sample']
+
+
+def load_expression(path, gene_set_file, sep='\t'):
+    """Read expression restricted to the gene list, reindexed to the FULL list order.
+
+    Genes present in the list but absent from the file are filled with 0, so the column
+    positions line up 1:1 (same count, same order) with the KEGG-CNN hierarchy mapping,
+    which indexes genes by position. Without this, a missing gene shifts every downstream
+    column and the model's gene indices run off the end of the input (CUDA index assert).
+    """
+    if gene_set_file is None:
+        return pd.read_csv(path, sep=sep)
+    gene_list = get_gene_list(gene_set_file)                 # includes 'Sample'
+    data = pd.read_csv(path, sep=sep, usecols=lambda x: x in gene_list)
+    genes_only = [g for g in gene_list if g != 'Sample']
+    out = {}
+    if 'Sample' in data.columns:
+        out['Sample'] = data['Sample'].values
+    n = len(data)
+    for g in genes_only:
+        out[g] = data[g].values if g in data.columns else np.zeros(n)
+    cols = (['Sample'] if 'Sample' in out else []) + genes_only
+    df = pd.DataFrame(out, columns=cols)
+    # Fill missing expression values with 0 (as the original loaders did). Un-filled NaNs
+    # propagate through the encoder into NaN predictions and crash the metrics.
+    df[genes_only] = df[genes_only].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+    return df
+
+
+class UnifiedDataloaderFactory:
+    """
+    One factory, parameterized by a DatasetSpec, that yields the drug-specific
+    cell-line / target dataloaders and the paired (contrastive) dataloaders.
+    """
+
+    def __init__(self, spec, gene_set_file, device=None):
+        self.spec = spec
+        self.device = device
+        self.gene_set_file = gene_set_file
+
+        # ---- expression ----
+        self.cell_line_rna = load_expression(spec.resolve('expression_file'), gene_set_file)
+        self.target_rna = load_expression(spec.resolve('pdx_expression_file'), gene_set_file)
+        if spec.kind == 'pdx' and 'Sample' in self.target_rna.columns:
+            self.target_rna['Sample'] = _norm_sample(self.target_rna['Sample'])
+
+        # ---- responses (normalized to Sample / UniqueID / Response) ----
+        self.cell_line_response = self._load_cell_line_response()
+        self.target_response, target_batch = self._load_target_response()
+
+        # ---- ComBat on target expression, keyed by dataset of origin (PDO) ----
+        if spec.apply_combat:
+            self.target_rna = self._combat_correct(self.target_rna, target_batch)
+
+        # ---- index everything on Sample ----
+        self.cell_line_rna = self._index_expression(self.cell_line_rna)
+        self.target_rna = self._index_expression(self.target_rna)
+
+        # Keep only responses whose sample has expression (a response without expression
+        # is unusable, and this prevents LabelEncoder 'unseen label' crashes).
+        self.cell_line_response = self.cell_line_response[
+            self.cell_line_response['Sample'].isin(self.cell_line_rna.index)].reset_index(drop=True)
+        self.target_response = self.target_response[
+            self.target_response['Sample'].isin(self.target_rna.index)].reset_index(drop=True)
+
+        # binarized cell-line response for stratification
+        self.binarized_cell_line_response = self.cell_line_response.copy()
+        self.binarized_cell_line_response['Response'] = binarize_auc_response(
+            self.cell_line_response['Response'])
+
+        # label-encode sample ids to integers (RNA index + response Sample col)
+        self.cl_enc = LabelEncoder()
+        self.tg_enc = LabelEncoder()
+        self.cell_line_rna.index = self.cl_enc.fit_transform(self.cell_line_rna.index)
+        self.target_rna.index = self.tg_enc.fit_transform(self.target_rna.index)
+
+        # A2: upload both (small) expression matrices to GPU ONCE here; every drug/fold
+        # dataset then gathers rows from these shared tensors instead of re-copying.
+        self._cl_preload = _preload_matrix(self.cell_line_rna, self.device)
+        self._tg_preload = _preload_matrix(self.target_rna, self.device)
+        self.cell_line_response['Sample'] = self.cl_enc.transform(self.cell_line_response['Sample'])
+        self.binarized_cell_line_response['Sample'] = self.cl_enc.transform(
+            self.binarized_cell_line_response['Sample'])
+        self.target_response['Sample'] = self.tg_enc.transform(self.target_response['Sample'])
+
+        self.cell_line_response.set_index('UniqueID', inplace=True)
+        self.binarized_cell_line_response.set_index('UniqueID', inplace=True)
+        self.target_response.set_index('UniqueID', inplace=True)
+
+        self.cross_validation_num = spec.cv_folds
+        self.validation_size = spec.val_size
+        # BC_SEED overrides the CV/split random seed so the same drug can be run at multiple
+        # independent stratified-shuffle-split seeds -> a real multi-seed CI on small-n drugs
+        # (single-seed per-drug AUROC swings wildly at ~5 responders). Default = spec seed.
+        self.random_seed = int(os.environ.get('BC_SEED', spec.random_seed))
+
+        self.cell_line_splits = {}
+        self.target_splits = {}
+        self.skipped = []
+        self._prepare_splits()
+
+    # ---------- response loaders ----------
+    def _load_cell_line_response(self):
+        spec = self.spec
+        df = pd.read_csv(spec.resolve('response_file'), sep='\t', low_memory=False)
+        df = df[[spec.resp_sample_col, spec.resp_drug_col, spec.resp_value_col]]
+        df.columns = ['Sample', 'UniqueID', 'Response']
+        return df
+
+    def _load_target_response(self):
+        """Returns (response_df[Sample,UniqueID,Response], batch_series_aligned_to_expr)."""
+        spec = self.spec
+        raw = pd.read_csv(spec.resolve('target_response_file'), sep='\t', low_memory=False)
+
+        if spec.kind == 'pdo':
+            df = pd.DataFrame({
+                'Sample': raw['Organoid'].astype(str),
+                'UniqueID': raw['Drug'],
+                'Response': (raw['AUC'] < 0.5).astype(int),
+                # continuous responsiveness rho in [0,1] (1 = most responsive = low AUC), for the
+                # negative-manifold geometry loss (BC_LOSS_TYPE=geo). Binary Response is unchanged.
+                'ResponseCont': (1.0 - raw['AUC'].clip(0.0, 1.0)).astype(float),
+            })
+            df['Group'] = df['Sample']          # organoids: one sample == one group
+            if os.environ.get('BC_GROUP_BY_DATASET') == '1' and 'Dataset' in raw.columns:
+                # COHORT-BLOCKED CV (iter116): group by dataset-of-origin so StratifiedGroupKFold holds out ENTIRE
+                # cohorts -> tests whether transfer survives to an UNSEEN cohort (controls the dataset confound, Part VII).
+                df['Group'] = raw['Dataset'].astype(str).values
+        else:  # pdx
+            df = raw[['Sample', 'Drug', 'Response']].copy()
+            df.columns = ['Sample', 'UniqueID', 'Response']
+            df = self._map_pdx_drug_ids(df)                     # NSC id -> cell-line UniqueID
+            df['Sample'] = _norm_sample(df['Sample'])           # patient/family-level id
+            # PDX raw Response is a ranked responsiveness (higher = more responsive); keep it as
+            # the continuous rho in [0,1] before binarising at >0.5 (orientation matches PDO).
+            df['ResponseCont'] = df['Response'].astype(float).clip(0.0, 1.0)
+            df['Response'] = (df['Response'] > 0.5).astype(int)
+            # Response is family-level (e.g. NCIPDM-287954-098-R); expression is per-aliquot
+            # (NCIPDM-112475-105-R-<aliquot>). Map each family response onto its individual
+            # expression aliquots for the join, and keep the family as the split GROUP so
+            # replicates of one tumor never straddle train/test (leak-free).
+            df = self._expand_family(df)
+
+        # batch (dataset of origin) for ComBat, aligned to target-expression samples
+        batch = None
+        if spec.apply_combat:
+            batch = self._target_batch_labels()
+        return df, batch
+
+    def _map_pdx_drug_ids(self, df):
+        """Map PDX NSC drug ids -> cell-line UniqueID so contrastive pairing can match drugs
+        (port of the original map_nci_drug_id). Rows with no mapping are dropped."""
+        try:
+            info = pd.read_csv(self.spec.resolve('drug_map_file'), sep='\t', low_memory=False)
+        except Exception as e:
+            print(f"[pdx-drugmap] could not read drug map ({e}); leaving ids unmapped")
+            return df
+        nsc_cols = [c for c in ['NSC', 'NSC.ID(NCI_IOA_AOA_drugs)', 'NSC.ID(NCI60_drug)']
+                    if c in info.columns]
+        if 'UniqueID' not in info.columns or not nsc_cols:
+            return df
+        nsc2uid = {}
+        for _, row in info[['UniqueID'] + nsc_cols].iterrows():
+            for c in nsc_cols:
+                nsc = str(row[c]).split('.')[-1]
+                nsc2uid[nsc] = row['UniqueID']
+        keep = df['UniqueID'].apply(lambda x: str(x).split('.')[-1] in nsc2uid)
+        n_before = df['UniqueID'].nunique()
+        df = df[keep].copy()
+        df['UniqueID'] = [nsc2uid[str(x).split('.')[-1]] for x in df['UniqueID']]
+        print(f"[pdx-drugmap] mapped {df['UniqueID'].nunique()}/{n_before} drugs to cell-line ids")
+        return df
+
+    def _expand_family(self, df):
+        """Map family-level PDX response onto individual expression aliquots; Group=family."""
+        indiv = self.target_rna['Sample'].astype(str)
+        fam = indiv.map(lambda s: s.rsplit('-', 1)[0])
+        fam_df = pd.DataFrame({'Sample_ind': indiv.values, 'Family': fam.values})
+        merged = df.merge(fam_df, left_on='Sample', right_on='Family', how='inner')
+        out = pd.DataFrame({
+            'Sample': merged['Sample_ind'].values,
+            'UniqueID': merged['UniqueID'].values,
+            'Response': merged['Response'].values,
+            'Group': merged['Family'].values,     # split group = family (leak-free)
+        })
+        if 'ResponseCont' in merged.columns:      # carry continuous responsiveness for the geo loss
+            out['ResponseCont'] = merged['ResponseCont'].values
+        return out
+
+    def _target_batch_labels(self):
+        """Dataset-of-origin per target sample, for ComBat. Read from metadata/source column.
+
+        BUG-3 FIX (env-gated, reversible via BC_FIX_COMBAT=1; default OFF = original behavior):
+        The default path below reads `combat_batch_column` from the SOURCE response/metadata
+        table, which is keyed by cell-line ids. The organoid TARGET samples are absent from
+        that table, so `_combat_correct`'s index intersection hits 0 organoids and ComBat
+        ends up "correcting" the cell lines instead (a no-op for the target domain). With
+        BC_FIX_COMBAT=1 (PDO only) we build a per-organoid Dataset-of-origin label directly
+        from the target response file (PDO_response_combined_v2.tsv), keyed by the SAME sample
+        id target_rna is indexed by (the 'Organoid' id == expression 'Sample'), so ComBat
+        actually corrects the organoids across the PDO studies.
+        """
+        spec = self.spec
+        if os.environ.get('BC_FIX_COMBAT') == '1' and spec.kind == 'pdo':
+            raw = pd.read_csv(spec.resolve('target_response_file'), sep='\t', low_memory=False)
+            bs = (raw[['Organoid', 'Dataset']].astype(str)
+                  .drop_duplicates(subset=['Organoid'])
+                  .set_index('Organoid')['Dataset'])
+            print(f"[combat][BC_FIX_COMBAT=1] target batch labels from "
+                  f"{os.path.basename(spec.resolve('target_response_file'))}: "
+                  f"{bs.nunique()} datasets over {len(bs)} organoids "
+                  f"-> {sorted(bs.unique().tolist())}")
+            return bs
+        col = spec.combat_batch_column
+        # Try metadata file first, then the response/source table.
+        for path in (spec.resolve('metadata_file'), spec.resolve('response_file')):
+            if os.path.exists(path):
+                meta = pd.read_csv(path, sep='\t', low_memory=False)
+                sample_col = 'Sample' if 'Sample' in meta.columns else (
+                    'sample_name' if 'sample_name' in meta.columns else spec.resp_sample_col)
+                if col in meta.columns and sample_col in meta.columns:
+                    return meta.set_index(sample_col)[col]
+        return None
+
+    def _combat_correct(self, expr, batch_series):
+        """Apply ComBat to a samples x genes expression frame using dataset-of-origin batches."""
+        if batch_series is None:
+            print("[combat] no batch column found; skipping ComBat")
+            return expr
+        e = expr.copy()
+        sample_col = 'Sample' if 'Sample' in e.columns else None
+        if sample_col is None:
+            return expr
+        # Dedupe BOTH sides by sample id so expression rows and batch labels align 1:1.
+        e = e.drop_duplicates(subset=[sample_col]).set_index(sample_col, drop=False)
+        bs = batch_series[~batch_series.index.duplicated(keep='first')]
+        gene_cols = [c for c in e.columns if c != 'Sample']
+        common = e.index.intersection(bs.index)
+        if len(common) < 3:
+            print("[combat] <3 samples with known batch; skipping ComBat")
+            return expr
+        sub = e.loc[common, gene_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+        batches = bs.loc[common].astype(str).values           # len == sub.shape[0]
+        assert len(batches) == sub.shape[0], (len(batches), sub.shape)
+        if len(pd.unique(batches)) < 2:
+            print("[combat] single batch; nothing to correct")
+            return expr
+        print(f"[combat] correcting {sub.shape[0]} samples x {sub.shape[1]} genes "
+              f"across {len(pd.unique(batches))} datasets of origin")
+        corrected = combat(sub, batches)
+        e.loc[common, gene_cols] = corrected.values
+        return e.reset_index(drop=True)
+
+    @staticmethod
+    def _index_expression(expr):
+        if 'Sample' in expr.columns:
+            expr = expr.set_index('Sample')
+        expr = expr[~expr.index.duplicated(keep='first')]
+        return expr
+
+    # ---------- disjoint CV splits (the fix) ----------
+    def _prepare_splits(self):
+        spec = self.spec
+        drug_ids = np.unique(np.concatenate([
+            self.cell_line_response.index.unique().values,
+            self.target_response.index.unique().values,
+        ]))
+        for drug_id in drug_ids:
+            # cell-line splits (stratified on binarized AUC)
+            if drug_id in self.cell_line_response.index:
+                cl = self.cell_line_response.loc[[drug_id]].reset_index()
+                bcl = self.binarized_cell_line_response.loc[[drug_id]].reset_index()
+                if bcl['Response'].sum() >= 2:
+                    s = make_cv_splits(cl, bcl['Response'].values,
+                                       spec.cv_folds, spec.val_size, self.random_seed)
+                    if s is not None:
+                        self.cell_line_splits[drug_id] = s
+
+            # target (PDX/PDO) splits — keep single-positive test folds
+            if drug_id in self.target_response.index:
+                tg = self.target_response.loc[[drug_id]].reset_index()
+                pos = int(tg['Response'].sum())
+                neg = int(len(tg) - pos)
+                if pos >= spec.min_pos and neg >= spec.min_neg:
+                    grp = tg['Group'].values if 'Group' in tg.columns else None
+                    s = make_cv_splits(tg, tg['Response'].astype(int).values,
+                                       spec.cv_folds, spec.val_size, self.random_seed,
+                                       groups=grp)
+                    if s is not None:
+                        self.target_splits[drug_id] = s
+                    else:
+                        self.skipped.append((drug_id, pos, neg))
+
+    def paired_keys(self):
+        """Drugs that have BOTH cell-line and target splits -> {drug: {cv_idx: {}}}."""
+        keys = {}
+        for drug_id in self.cell_line_splits:
+            if drug_id in self.target_splits:
+                folds = set(self.cell_line_splits[drug_id]) & set(self.target_splits[drug_id])
+                keys[drug_id] = {cv: {} for cv in sorted(folds)}
+        return keys
+
+    # ---------- dataloaders ----------
+    def _response_loaders(self, splits, rna_df, batch_size, num_samples=None, preloaded=None):
+        loaders = {}
+        for key, sub in splits.items():
+            ds = ResponseDataset(sub, rna_df, self.device, preloaded=preloaded)
+            if key == 'train' and num_samples is not None:
+                weights = torch.ones(len(sub))
+                sampler = torch.utils.data.sampler.WeightedRandomSampler(weights, num_samples)
+                loaders[key] = DataLoader(ds, batch_size=batch_size, sampler=sampler)
+            else:
+                loaders[key] = DataLoader(ds, batch_size=batch_size,
+                                          shuffle=(key == 'train'))
+        return loaders['train'], loaders['val'], loaders['test']
+
+    def get_drug_specific_cell_line_dataloaders(self, drug_id, cv_idx, batch_size=128, num_samples=None):
+        split = self.cell_line_splits[drug_id][cv_idx]
+        samples = pd.concat([split[k]['Sample'] for k in split])
+        rna = self.cell_line_rna.loc[samples]
+        rna = rna[~rna.index.duplicated(keep='first')]
+        return self._response_loaders(split, rna, batch_size, num_samples,
+                                      preloaded=self._cl_preload)
+
+    def get_drug_specific_pdx_dataloaders(self, drug_id, cv_idx, batch_size=128, num_samples=None):
+        split = self.target_splits[drug_id][cv_idx]
+        samples = pd.concat([split[k]['Sample'] for k in split])
+        rna = self.target_rna.loc[samples]
+        rna = rna[~rna.index.duplicated(keep='first')]
+        return self._response_loaders(split, rna, batch_size, num_samples,
+                                      preloaded=self._tg_preload)
+
+    def get_paired_cell_line_pdx_loaders(self, drug_id, cv_idx, num_samples, batch_size=128):
+        cl_split = deepcopy(self.cell_line_splits[drug_id][cv_idx])
+        tg_split = self.target_splits[drug_id][cv_idx]
+        out = {}
+        for set_name in cl_split:
+            cl_samples = np.unique(cl_split[set_name]['Sample'])
+            tg_samples = np.unique(tg_split[set_name]['Sample'])
+            # continuous cell-line responsiveness rho in [0,1] (1 = responsive = low AUC) for the
+            # geo loss, computed BEFORE the AUC column is binarised in-place below.
+            cl_split[set_name]['ResponseCont'] = (
+                1.0 - pd.to_numeric(cl_split[set_name]['Response'], errors='coerce').clip(0.0, 1.0)).fillna(0.0)
+            cl_split[set_name]['Response'] = binarize_auc_response(cl_split[set_name]['Response'])
+            eff = num_samples if set_name == 'train' else 1000
+            paired = DrugSpecificPairedDataset(
+                eff, batch_size,
+                self.cell_line_rna.loc[cl_samples], cl_split[set_name],
+                self.target_rna.loc[tg_samples], tg_split[set_name],
+                device=self.device,
+                cl_preloaded=self._cl_preload, tg_preloaded=self._tg_preload)
+            out[set_name] = DataLoader(paired, batch_size=1)
+        return out['train'], out['val'], out['test']
+
+
+# --------------------------------------------------------------------------- #
+# Datasets (pandas-based; identical semantics to the original PDX versions)    #
+# --------------------------------------------------------------------------- #
+def _preload_matrix(rna_df, device):
+    """Upload a full (Sample-indexed, gene-column) expression matrix to GPU ONCE.
+
+    Returns (padded_tensor, {sample: row}). The tensor has a trailing all-zero row so a
+    sample missing from the matrix gathers zeros -- matching the reindex(...)->nan_to_num
+    semantics of the pandas path. ResponseDataset then indexes this shared GPU tensor
+    instead of re-doing reindex->to_numpy->to(device) for every drug/fold (amend A2)."""
+    df = rna_df[~rna_df.index.duplicated(keep='first')]
+    mat = np.nan_to_num(df.to_numpy(dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    t = torch.from_numpy(mat).float()
+    if device is not None:
+        t = t.to(device)
+    zero_row = torch.zeros(1, t.shape[1], dtype=t.dtype, device=t.device)
+    padded = torch.cat([t, zero_row], dim=0)          # index len(df) == the zero row
+    row_index = {s: i for i, s in enumerate(df.index)}
+    return padded, row_index
+
+
+class ResponseDataset(Dataset):
+    """RNA/response dataset, materialized once into tensors.
+
+    The original per-item `rna_df.loc[sample_id]` pandas lookup is O(n) and, for
+    high-sample drugs (common drugs screened on thousands of cell lines), stalls the
+    paired-dataset construction for many minutes. Here the RNA rows for every response are
+    resolved ONCE with a vectorized `reindex` and cached as a tensor, so __getitem__ is an
+    O(1) tensor index. This is the "cache the paired dataset" fix.
+    """
+
+    def __init__(self, response_df, rna_df, device, preloaded=None, with_cont=False):
+        super().__init__()
+        response_df = response_df.reset_index(drop=True)
+        samples = response_df['Sample'].values
+        resp = np.asarray(response_df['Response'].values, dtype=np.float32)
+        # with_cont: also carry a continuous responsiveness channel (rho in [0,1]) so the
+        # paired dataset can build the negative-manifold geometry (BC_LOSS_TYPE=geo). resp
+        # becomes a 2-col tensor [:,0]=binary Response, [:,1]=ResponseCont. Falls back to the
+        # binary value if ResponseCont is absent (so non-geo runs are byte-identical).
+        if with_cont:
+            cont = np.asarray(response_df['ResponseCont'].values, dtype=np.float32) \
+                if 'ResponseCont' in response_df.columns else resp.copy()
+            resp = np.stack([resp, cont], axis=1)
+        else:
+            resp = resp[:, None]
+        self.device = device
+        if preloaded is not None:
+            # A2: gather rows from the factory's shared GPU matrix (no host->device copy,
+            # no per-fold pandas reindex). Missing samples -> the trailing zero row.
+            padded, row_index = preloaded
+            miss = padded.shape[0] - 1
+            idx = torch.tensor([row_index.get(s, miss) for s in samples],
+                               dtype=torch.long, device=padded.device)
+            self.rna = padded.index_select(0, idx)
+            self.resp = torch.from_numpy(resp).float().to(padded.device)
+            return
+        # Vectorized sample -> RNA row resolution (once), missing -> 0.
+        rna_mat = rna_df.reindex(samples).to_numpy(dtype=np.float32)
+        rna_mat = np.nan_to_num(rna_mat, nan=0.0, posinf=0.0, neginf=0.0)
+        self.rna = torch.from_numpy(rna_mat).float()
+        self.resp = torch.from_numpy(resp).float()
+        if device is not None:
+            self.rna = self.rna.to(device)
+            self.resp = self.resp.to(device)
+
+    def __getitem__(self, index):
+        return self.rna[index], self.resp[index]
+
+    def __len__(self):
+        return self.rna.shape[0]
+
+
+class DrugSpecificPairedDataset(Dataset):
+    """Balanced paired (cell-line, target) batches with a response-match matrix."""
+
+    def __init__(self, num_samples, batch_size, cl_rna, cl_resp, tg_rna, tg_resp, device=None,
+                 cl_preloaded=None, tg_preloaded=None):
+        super().__init__()
+        self.num_samples = num_samples
+        self.batch_size = batch_size
+        self.device = device
+        self.batches = {}
+
+        cl_ds = ResponseDataset(cl_resp, cl_rna.loc[np.unique(cl_resp['Sample'])], device,
+                                preloaded=cl_preloaded, with_cont=True)
+        tg_ds = ResponseDataset(tg_resp, tg_rna.loc[np.unique(tg_resp['Sample'])], device,
+                                preloaded=tg_preloaded, with_cont=True)
+
+        cl_w = get_balanced_class_weights(cl_resp)
+        tg_w = get_balanced_class_weights(tg_resp)
+        cl_sampler = torch.utils.data.sampler.WeightedRandomSampler(cl_w, num_samples)
+        tg_sampler = torch.utils.data.sampler.WeightedRandomSampler(tg_w, num_samples)
+        # drop_last guard: a trailing batch of size 1 makes model.py's `batch[0].squeeze()`
+        # collapse the batch dim -> 1D tensor -> BatchNorm1d "expected 2D/3D got 1D" (and the
+        # 0-d label -> "too many indices"). Drop the last batch ONLY when it would be size 1
+        # (num_samples % batch_size < 2), which keeps every other (full) batch. Fixes the
+        # small-drug fold failures (e.g. HB3599/Docetaxel/Osimertinib) that blocked coverage.
+        _drop_last = (num_samples % batch_size) < 2
+        cl_loader = DataLoader(cl_ds, batch_size=batch_size, sampler=cl_sampler, drop_last=_drop_last)
+        tg_loader = DataLoader(tg_ds, batch_size=batch_size, sampler=tg_sampler, drop_last=_drop_last)
+
+        def match_fn(dx, dy):
+            return torch.stack([dx * y for y in dy]).squeeze() - torch.stack(
+                [torch.where(dx != y, torch.ones_like(dx), torch.zeros_like(dx)) for y in dy]).squeeze()
+
+        import math as _math
+        def geo_fn(rx, ry):
+            # Negative-manifold target Gram: target_cos[i,j] = cos(pi * |rho_i - rho_j|), with
+            # rho the continuous responsiveness in [0,1]. Geodesic arccos(cos)=pi*|drho| is thus
+            # linearly proportional to the delta in AUC/rank responsiveness. [n_cl, n_tg].
+            d = torch.abs(rx.reshape(-1, 1) - ry.reshape(1, -1)).clamp(0.0, 1.0)
+            return torch.cos(_math.pi * d)
+
+        for bid, ((cs, cr), (ts, tr)) in enumerate(zip(cl_loader, tg_loader)):
+            # cr/tr are [B,2]: col0 binary Response, col1 continuous ResponseCont (with_cont=True).
+            cr_bin, cr_cont = cr[:, 0:1], cr[:, 1]
+            tr_bin, tr_cont = tr[:, 0:1], tr[:, 1]
+            m = match_fn(cr_bin, tr_bin)
+            m_geo = geo_fn(cr_cont, tr_cont)
+            self.batches[bid] = (cs, ts,
+                                 m.to(device) if device is not None else m,
+                                 cr_bin.to(device) if device is not None else cr_bin,
+                                 tr_bin.to(device) if device is not None else tr_bin,
+                                 m_geo.to(device) if device is not None else m_geo)
+
+    def __len__(self):
+        return int(np.ceil(self.num_samples / self.batch_size))
+
+    def __getitem__(self, index):
+        return self.batches[index]
+
+
+def get_data_generator(dataloader):
+    return None if dataloader is None else dataloader.__iter__()
+
+
+# Backwards-compat alias: copied compute modules import the old factory name.
+ResponseDataloadersFactory = UnifiedDataloaderFactory

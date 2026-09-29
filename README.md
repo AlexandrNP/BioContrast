@@ -1,69 +1,55 @@
-# Bio-Contrast
+# bio-contrast-unified
 
+One configurable codebase for the Bio-Contrast PDX **and** PDO experiments, with the
+result-integrity fixes applied. **No data is copied** — `data`, `pdo_data`, `KEGG`, `KGML`
+are symlinks into the existing folders.
 
-# Drug Response Prediction Model
+## What changed vs the original folders
+| Area | Original | Here |
+|---|---|---|
+| CV splits | `StratifiedShuffleSplit(n_splits=cv)` → **overlapping** test folds | `splits.py`: `StratifiedKFold` → **disjoint** test folds + inner val split |
+| Single-positive test folds | filtered/degenerate | **kept** (deemed legit; `min_pos=1`) |
+| PDO expression | raw, uncorrected | `combat.py`: **ComBat** by dataset of origin (`spec.apply_combat`) |
+| PDX family expansion | ON (replicate leakage) | **OFF** by default (`apply_family_expansion=False`) |
+| PDX vs PDO | two divergent `data.py` | one `data.py` + `DatasetSpec` |
+| Parallelism | N hand-copied folders, drug list reversed | `launch.py`: **N-GPU** scheduler, N auto-detected/flexible |
 
-A deep learning framework for predicting drug responses in cancer cell lines and patient-derived organoids (PDOs) using gene expression data and transfer learning.
+## Layout
+```
+dataset_spec.py       PDX/PDO specs + experiments.yaml loader
+config/experiments.yaml   the (dataset x variant) matrix
+splits.py             disjoint CV (the fix)          [unit-tested]
+combat.py             ComBat batch correction        [unit-tested]
+data.py               UnifiedDataloaderFactory (spec-driven; wires splits + combat)
+run_experiment.py     per-worker: shards drugs, runs baselines or contrastive
+launch.py             multi-GPU scheduler (flexible N)
+model.py modules.py trainer.py utils.py ...   copied compute code (from bio-contrast-3)
+_ref_data_pdx.py _ref_data_pdo.py             original data.py variants (provenance)
+```
 
-## Overview
+## Run everything in parallel
+```bash
+# use all visible GPUs (auto-detected)
+python launch.py --out results_unified
 
-This project implements a transfer learning approach to predict drug responses across different biological models. The framework consists of:
+# explicit 20 GPUs, 2 shards each (finer load balancing), longer training
+python launch.py --num-gpus 20 --shards-per-gpu 2 --epochs 2000
 
-- Contrastive learning between cell lines and PDO data
-- Hierarchical neural networks utilizing KEGG pathway information
-- Drug response prediction models for both cell lines and PDOs
-- Evaluation metrics for both regression (cell lines) and classification (PDOs) tasks
+# see the job matrix without launching
+python launch.py --dry-run
+```
+GPU count is never hardcoded: it comes from `--gpus`, `--num-gpus`, `$CUDA_VISIBLE_DEVICES`,
+or `torch.cuda.device_count()`, in that order.
 
+## Tests (no GPU / no real data needed)
+```bash
+python tests/test_fixes.py
+```
+Checks that test folds are disjoint, single-positive folds survive, and ComBat removes
+cross-dataset batch shift.
 
-## Installation
-
-Please use ```environment.yml``` to setup Anaconda environment.
-
-## Project Structure
-
-- `run.py` - Main script for training and evaluating models
-- `data.py` - Data loading and preprocessing utilities
-- `model.py` - Neural network model architectures 
-- `modules.py` - Custom neural network modules and layers
-- `trainer.py` - Training loop and evaluation functions
-- `configuration.py` - Configuration management
-- `utils.py` - Helper functions and loss calculations
-- `hierarchies.py` - KEGG pathway hierarchy processing
-
-## Configuration
-
-The model configurations are specified in `config.yaml`. Key parameters include:
-
-- Model architectures (encoders, predictors)
-- Training parameters (learning rate, batch size)
-- Network hyperparameters (hidden layers, dropout)
-
-## Usage
-
-To train a model:
-
-```python run.py```
-
-The script will:
-1. Load cell line and PDO data
-2. Train models for each drug
-3. Perform cross-validation
-4. Save results and model checkpoints
-
-## Model Architecture
-
-The framework consists of several key components:
-
-### 1. Contrastive Learning Module
-- Learns shared representations between cell lines and PDOs
-- Uses temperature-scaled cross entropy loss
-- Implements domain adaptation through contrastive learning
-
-### 2. KEGG Hierarchical CNN
-- Incorporates biological pathway information
-- Uses hierarchical convolutional layers
-- Processes gene expression data through pathway-guided architecture
-
-### 3. Response Predictors
-- Cell line response regression
-- PDO response classification
+## Status
+- `splits.py`, `combat.py`, `dataset_spec.py`, `launch.py` — complete + unit-tested.
+- `data.py` / `run_experiment.py` — complete and structured; **need a GPU smoke test against
+  the real files** to confirm PDO column names (`combat_batch_column`) and the trainer wiring.
+  Set the real dataset-of-origin column in `config/experiments.yaml` if it is not `source`.

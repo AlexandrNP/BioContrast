@@ -1,3 +1,4 @@
+import os
 import torch
 import lightgbm as lgbm
 import torch.nn.functional as F
@@ -5,9 +6,47 @@ import torch.nn.functional as F
 
 from torch import nn
 from configuration import Configuration, assert_configuration_availability
-from modules import MLP, ResNet, BetaRegressionLayer, KEGGHierarchicalCNN
+from modules import MLP, ResNet, BetaRegressionLayer, KEGGHierarchicalCNN, KEGGPathwayBottleneck
+
+
+def _build_gene_encoder(device):
+    """Construct the shared gene->embedding encoder.
+
+    BC_ENCODER selects the encoder for the interpretability ablation:
+      'hierarchical' (default) = KEGGHierarchicalCNN, the current behavior.
+      'pathway'                = KEGGPathwayBottleneck, the interpretable-by-
+                                 construction per-pathway bottleneck whose P
+                                 activations ARE the attribution layer.
+    Default path is byte-for-byte the original KEGGHierarchicalCNN(device).
+    """
+    if os.environ.get('BC_ENCODER', 'hierarchical') == 'pathway':
+        return KEGGPathwayBottleneck(device)
+    return KEGGHierarchicalCNN(device)
 from utils import *
 from sklearn.model_selection import train_test_split
+
+
+def _strip_outer_singleton(t):
+    """B1 fix: normalize a batch tensor to 2D+ WITHOUT ever removing the batch dim.
+
+    The paired loaders wrap each already-batched tensor in an outer
+    ``DataLoader(batch_size=1)`` (data.py), so a matched batch arrives as
+    ``[1, B, G]`` / ``[1, B, B]``; the eval/predict path also feeds raw loader
+    batches ``[B, G]``. A bare ``.squeeze()`` collapses the batch dim when B==1
+    (-> BatchNorm1d "got 1D input" and label "too many indices"). This strips
+    ONLY leading size-1 axes while keeping the result at least 2D, so the real
+    batch dim survives for every B (including B==1).
+    """
+    if not torch.is_tensor(t):
+        return t
+    while t.dim() > 2 and t.size(0) == 1:
+        t = t.squeeze(0)
+    if t.dim() == 1:
+        # A batch that collapsed to 1D upstream (size-1 eval/test fold in small-data CV) must be
+        # promoted back to [1, features] -- BatchNorm1d rejects 1D input. In eval mode (predict)
+        # a batch of 1 is fine (running stats); in train the matched-batch <2 guard skips it first.
+        t = t.unsqueeze(0)
+    return t
 
 
 class ConfigurableFreezableModule(nn.Module):
@@ -56,7 +95,7 @@ class CellLineEncoder(ConfigurableFreezableModule):
         if 'skip_levels' in configuration[self._CONFIG_NAME]:
             configuration[self._CONFIG_NAME].pop('skip_levels')
         # self._model = MLP(**configuration[self._CONFIG_NAME])
-        self._model = KEGGHierarchicalCNN(configuration['device'])
+        self._model = _build_gene_encoder(configuration['device'])
         # self._model = ResNet(**configuration[self._CONFIG_NAME])
 
     def forward(self, x):
@@ -73,7 +112,7 @@ class PDXEncoder(ConfigurableFreezableModule):
         super().__init__(configuration)
         if 'skip_levels' in configuration[self._CONFIG_NAME]:
             configuration[self._CONFIG_NAME].pop('skip_levels')
-        self._model = KEGGHierarchicalCNN(configuration['device'])
+        self._model = _build_gene_encoder(configuration['device'])
         # self._model = MLP(**configuration[self._CONFIG_NAME])
         # self._model = ResNet(**configuration[self._CONFIG_NAME])
 
@@ -161,19 +200,86 @@ class ContrastiveLearner(ConfigurableFreezableModule):
         # return self.pdx_projection(data)
 
     def forward(self, batch):
-        cell_line_features = self.cell_line_encoder(batch[0].squeeze())
-        pdx_features = self.pdx_encoder(batch[1].squeeze())
-        labels = batch[2].squeeze()
+        cell_line_features = self.cell_line_encoder(_strip_outer_singleton(batch[0]))
+        pdx_features = self.pdx_encoder(_strip_outer_singleton(batch[1]))
+        labels = _strip_outer_singleton(batch[2])
         device = next(self.parameters()).device
+
+        # print("--->PDX encoder:")
+        # for name, params in self.pdx_encoder.named_parameters():
+        #    print("-->name:",name, "-->max_grad:", params.grad.max(), "-->min_grad:", params.grad.min())
+        # print("--->PDX projection:")
+        # for name, params in self.pdx_projection.named_parameters():
+        #    print("-->name:",name, "-->max_grad:", params.grad.max(), "-->min_grad:", params.grad.min())
 
         cell_line_embeddings = cell_line_features
         pdx_embeddings = pdx_features
 
-        loss = sup_con_transfer_learning_fast(
-            cell_line_embeddings, pdx_embeddings, labels, temperature=self.temperature, alpha=0.5, device=device)
-        #if loss != loss:
-        #    breakpoint()
-        #    pass
+        # cell_line_embeddings = self.cell_line_projection(cell_line_features)
+        # pdx_embeddings = self.pdx_projection(pdx_features)
+
+        # loss = contrastive_loss_cell_line_pdx(cell_line_embeddings, pdx_embeddings, labels, temperature=self.temperature, device=device)
+
+        # LATEST TEST
+        # loss = anchorless_sup_con_loss(
+        #    cell_line_embeddings, pdx_embeddings, labels, temperature=self.temperature, device=device)
+        # loss = sup_con_mod(cell_line_embeddings, pdx_embeddings, labels, temperature=self.temperature, device=device)
+        # BC_LOSS_TYPE selects the contrastive objective for the loss ablation:
+        #   supcon (default) = BioContrast (3-class response-match, multi-positive)
+        #   infonce           = single-positive InfoNCE
+        #   supcon_std        = standard SupCon (same-response positives, no mismatch clustering)
+        #   ntxent            = NT-Xent / CLIP self-supervised (no labels)
+        _lt = os.environ.get('BC_LOSS_TYPE', 'supcon')
+        if _lt == 'infonce':
+            loss = info_nce_transfer_learning(
+                cell_line_embeddings, pdx_embeddings, labels, temperature=self.temperature, alpha=0.5, device=device)
+        elif _lt == 'supcon_std':
+            loss = supcon_std_transfer(
+                cell_line_embeddings, pdx_embeddings, labels, temperature=self.temperature, alpha=0.5, device=device)
+        elif _lt == 'ntxent':
+            loss = ntxent_transfer(cell_line_embeddings, pdx_embeddings, self.temperature)
+        elif _lt == 'supcon_fixed':
+            loss = supcon_fixed_transfer(
+                cell_line_embeddings, pdx_embeddings, labels, temperature=self.temperature, alpha=0.5, device=device)
+        elif _lt == 'biocontrast':
+            # PROPER BioContrast (ICML): single-class one-class-classification objective (A+U, eqs 4-6).
+            loss = biocontrast_transfer(
+                cell_line_embeddings, pdx_embeddings, labels, temperature=self.temperature, alpha=0.5, device=device)
+        elif _lt == 'supcon_pos':
+            loss = supcon_pos_transfer(
+                cell_line_embeddings, pdx_embeddings, labels, temperature=self.temperature, alpha=0.5, device=device)
+        elif _lt == 'supcon3fix':
+            # FIXED 3-class biocontrast loss: cluster the two same-response classes only (mismatch as
+            # negatives), restoring a real contrastive gradient (the original 3-class loss is degenerate).
+            loss = sup_con_3class_fixed_transfer(
+                cell_line_embeddings, pdx_embeddings, labels, temperature=self.temperature, alpha=0.5, device=device)
+        elif _lt in ('geo', 'geo_aux'):
+            # NEGATIVE-MANIFOLD geometry: hypersphere geodesic between cl_i and tg_j proportional to
+            # their delta in continuous responsiveness (AUC for PDO/cell-line, ranked for PDX). The
+            # trainer forwards the geo Gram (paired-batch idx 5) as batch[3] of the truncated
+            # matched_batch; fall back to a neutral zero target if a caller omitted it.
+            if len(batch) > 3:
+                target_cos = _strip_outer_singleton(batch[3])
+            else:
+                target_cos = torch.zeros(cell_line_embeddings.size(0), pdx_embeddings.size(0), device=device)
+            geo_loss = supcon_geo_transfer(
+                cell_line_embeddings, pdx_embeddings, target_cos, temperature=self.temperature, alpha=0.5, device=device)
+            if _lt == 'geo_aux':
+                # AUXILIARY variant (iter102 next step): keep supcon's discriminative push, add the
+                # continuous AUC-ordering as a SOFT regularizer. loss = supcon + lambda * geo.
+                lam = float(os.environ.get('BC_GEO_LAMBDA', '0.2'))
+                sup_loss = supcon_std_transfer(
+                    cell_line_embeddings, pdx_embeddings, labels, temperature=self.temperature, alpha=0.5, device=device)
+                loss = sup_loss + lam * geo_loss
+            else:
+                loss = geo_loss
+        else:
+            loss = sup_con_transfer_learning_fast(
+                cell_line_embeddings, pdx_embeddings, labels, temperature=self.temperature, alpha=0.5, device=device)
+        if loss != loss:
+            # NaN guard (was a debug breakpoint() in the original). Skip this batch's
+            # contrastive contribution rather than halting the whole run.
+            loss = torch.zeros((), device=device, requires_grad=True)
 
         return loss
 
@@ -251,6 +357,13 @@ class CellLineTransferLearner(ConfigurableFreezableModule):
         #                                  configuration=configuration)
         self.set_device(configuration['device'])
         configuration[self._CONFIG_NAME]['device'] = self.device
+        # BC_HEAD selects the downstream classification-head type for the ablation:
+        # 'relu' (default) keeps the non-linear MLP head ([512,256]+ReLU); 'linear'
+        # collapses both transfer predictors to a bare Linear+Sigmoid (no hidden layers).
+        if os.environ.get('BC_HEAD', 'relu') == 'linear':
+            _hcfg = configuration[self._CONFIG_NAME]
+            _hcfg['DirectPredictor']['hidden_layers'] = []
+            _hcfg['DirectPDXPredictor']['DirectPredictor']['hidden_layers'] = []
         self.clip = ContrastiveLearner(configuration[self._CONFIG_NAME])
         # self.cell_line_predictor = LGBMCellLineResponseRegressor(
         #    configuration[self._CONFIG_NAME])
@@ -275,6 +388,18 @@ class CellLineTransferLearner(ConfigurableFreezableModule):
     def unfreeze(self):
         self.clip.unfreeze()
         self.cell_line_predictor.unfreeze()
+
+    def set_moa_target(self, drug_id=None, pathway_names=None):
+        """B2: install the per-drug MoA pathway gate on BOTH KEGG encoders (cell-line +
+        target). No-op unless the encoder exposes apply_moa_target (KEGGHierarchicalCNN)
+        and BC_MOA_GATE=1 is set at import time. Call once per drug before train/eval;
+        pass drug_id=None to clear the gate."""
+        n = 0
+        for m in self.modules():
+            if m is not self and hasattr(m, 'apply_moa_target'):
+                m.apply_moa_target(drug_id=drug_id, pathway_names=pathway_names)
+                n += 1
+        return n
 
     def _forward_clip(self, matched_batch):
         return self.clip(matched_batch)
@@ -303,7 +428,7 @@ class CellLineTransferLearner(ConfigurableFreezableModule):
         pdx_rna = pdx_batch[0]
         pdx_response = pdx_batch[1]
         pdx_embedding = self.clip.encode_pdx(pdx_rna)
-        auc_predictions = self.cell_line_predictor(pdx_embedding).squeeze()
+        auc_predictions = self.cell_line_predictor(pdx_embedding).squeeze(-1)
         # binarization_fct = nn.Sigmoid()
         pdx_predictions = auc_predictions  # binarization_fct(auc_predictions)
         return self.pdx_loss_fct(pdx_predictions, pdx_response)
@@ -311,7 +436,7 @@ class CellLineTransferLearner(ConfigurableFreezableModule):
     def _forward_direct_pdx_pred(self, pdx_batch):
         pdx_rna = pdx_batch[0]
         pdx_response = pdx_batch[1]
-        predictions = self.pdx_direct_predictor(pdx_rna).squeeze()
+        predictions = self.pdx_direct_predictor(pdx_rna).squeeze(-1)
         #breakpoint()
         #m = nn.Sigmoid()
         return self.pdx_loss_fct(predictions, pdx_response)
@@ -323,7 +448,7 @@ class CellLineTransferLearner(ConfigurableFreezableModule):
         self.cell_line_predictor(cell_line_embeddings, cell_line_response)
 
     def predict(self, X, encoding_mode='cell_line', direct=False, binarize=False):
-        X = X.squeeze()
+        X = _strip_outer_singleton(X)
         embeddings = None
         if encoding_mode == 'cell_line':
             embeddings = self.clip.encode_cell_line(X)
@@ -369,8 +494,7 @@ class CellLineTransferLearner(ConfigurableFreezableModule):
             for parameter in self.clip.cell_line_encoder.parameters():
                 any_nans += torch.isnan(parameter).sum()
             if any_nans > 0:
-                breakpoint()
-                pass
+                pass  # was a debug breakpoint()
             clip_loss = self._forward_clip(matched_batch)
         if cell_line_batch is not None: #and self.regressor_batched_training:
             cell_line_loss = self._forward_cell_line_pred(cell_line_batch)
